@@ -15,7 +15,7 @@ import { WebSocketServerTransport } from "./ws-transport.js";
 function buildMcpServer(bridge: BridgeServer): Server {
   const tools = buildTools(bridge);
   const server = new Server(
-    { name: "chromanche", version: "0.12.0" },
+    { name: "chromanche", version: "0.12.1" },
     { capabilities: { tools: {} } }
   );
 

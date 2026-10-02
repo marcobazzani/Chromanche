@@ -10,7 +10,7 @@ Lets any MCP-capable coding agent drive your real, logged-in Chrome through a lo
 
 ## What you get
 
-MCP tools exposed over stdio, relayed to the extension over a localhost WebSocket. Current set (v0.12.0, 30 tools):
+MCP tools exposed over stdio, relayed to the extension over a localhost WebSocket. Current set (v0.12.1, 30 tools):
 
 - **Tabs:** `tabs_list`, `tabs_create`, `tabs_close`, `tabs_activate`
 - **Navigation & read:** `page_navigate`, `page_snapshot` (uid-annotated a11y tree / text / dom, optional bounds; `since:"last"` returns only changed lines since the tab's previous snapshot — a token/speed saver on heavy pages), `page_screenshot` (returns MCP image content + viewport metadata for vision-driven flows)
