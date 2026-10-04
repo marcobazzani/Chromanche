@@ -8,6 +8,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -391,7 +392,6 @@ describe("install.sh under WSL", () => {
     expect(readFileSync(join(winExt(), "manifest.json"), "utf8")).toBe("{}\n");
     expect(stdout).toContain(`select:\n       ${WIN_PROFILE}\\.chromanche\\extension\n`);
     expect(stdout).toContain(`Windows copy: ${WIN_PROFILE}\\.chromanche\\extension\n`);
-    expect(stdout).toContain("CHROMANCHE_BROWSER_PLATFORM=linux");
     // cmd.exe without AutoRun; wslpath got the CR-stripped profile path (the
     // fake only answers for the exact string).
     const log = readFileSync(commandLog, "utf8");
@@ -402,6 +402,46 @@ describe("install.sh under WSL", () => {
     const entry = join(home, ".chromanche", "mcp-server", "dist", "index.cjs");
     expect(log).toContain(`claude mcp add chromanche --scope user -- node ${entry}`);
     expect(existsSync(join(home, ".chromanche", "extension", "manifest.json"))).toBe(true);
+  });
+
+  it("creates the pairing token and tells the user exactly what to enter in the popup", () => {
+    writeFakeUname("Linux", WSL2_KERNEL);
+    fakeWindows();
+
+    const { stdout } = runCapture();
+
+    const tokenFile = join(home, ".chromanche", "token");
+    const token = readFileSync(tokenFile, "utf8");
+    // Same format the server accepts (packages/mcp-server/src/wsl.ts), 0600.
+    expect(token).toMatch(/^wsl_[0-9a-f]{64}$/);
+    expect(statSync(tokenFile).mode & 0o777).toBe(0o600);
+    expect(stdout).toContain('Pair the extension (needed once under WSL): click the Chromanche\n     icon, open "Advanced — override pairing", enter\n');
+    expect(stdout).toContain(`       Port:   48765\n       Token:  ${token}\n`);
+    expect(stdout).toContain(`The token is kept in ${tokenFile}`);
+    expect(stdout).not.toContain("Pairing is automatic");
+  });
+
+  it("keeps the existing token on re-install, so the popup stays paired", () => {
+    writeFakeUname("Linux", WSL2_KERNEL);
+    fakeWindows();
+    runCapture();
+    const token = readFileSync(join(home, ".chromanche", "token"), "utf8");
+
+    const { stdout } = runCapture();
+
+    expect(readFileSync(join(home, ".chromanche", "token"), "utf8")).toBe(token);
+    expect(stdout).toContain(`Token:  ${token}\n`);
+  });
+
+  it("replaces a legacy derived token left by an earlier version", () => {
+    writeFakeUname("Linux", WSL2_KERNEL);
+    fakeWindows();
+    mkdirSync(join(home, ".chromanche"), { recursive: true });
+    writeFileSync(join(home, ".chromanche", "token"), "2fe10176".repeat(8));
+
+    runCapture();
+
+    expect(readFileSync(join(home, ".chromanche", "token"), "utf8")).toMatch(/^wsl_[0-9a-f]{64}$/);
   });
 
   it("detects WSL from WSL_DISTRO_NAME even with an unrecognised kernel string", () => {
@@ -452,7 +492,10 @@ describe("install.sh under WSL", () => {
     expect(existsSync(winExt())).toBe(false);
     expect(stdout).toContain(`select:\n       ${join(home, ".chromanche", "extension")}\n`);
     expect(stdout).not.toContain("Windows copy:");
-    expect(stdout).not.toContain("WSL:");
+    // Outside WSL pairing stays automatic: no token created, no popup steps.
+    expect(stdout).toContain("Pairing is automatic");
+    expect(stdout).not.toContain("Pair the extension");
+    expect(existsSync(join(home, ".chromanche", "token"))).toBe(false);
   });
 });
 

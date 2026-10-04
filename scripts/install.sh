@@ -340,8 +340,8 @@ fi
 # --- WSL: make the extension loadable by Chrome on Windows -------------------
 # Mirror the extension into the Windows profile so Chrome loads it from a
 # plain drive path instead of the Linux filesystem. The MCP server stays in
-# WSL: Chrome on Windows reaches its 127.0.0.1 listener through WSL's default
-# localhost forwarding.
+# WSL: Chrome on Windows reaches its 127.0.0.1 listener through WSL's
+# localhost forwarding (default) or mirrored networking.
 LOAD_DIR="$EXT_DIR"
 if [ "$IS_WSL" = "1" ]; then
   WIN_HOME="$(_wsl_windows_home)"
@@ -525,6 +525,50 @@ case " $CLAUDE_STATUS $CODEX_STATUS $OPENCODE_STATUS $COPILOT_STATUS " in
   *" missing "*) CLIENTS_SUMMARY="${CLIENTS_SUMMARY}"$'\n'"    Install one of them later? Re-run this installer and it gets registered too." ;;
 esac
 
+# Under WSL, automatic pairing can't work reliably (WSL and Chrome on Windows
+# often see different timezones), so the server uses a fixed port and a random
+# token that the user enters in the extension popup once. Keep WSL_PORT and
+# the token format in sync with packages/mcp-server/src/wsl.ts. The token is
+# created here so it can be shown below; the server reuses it.
+WSL_PORT=48765
+if [ "$IS_WSL" = "1" ]; then
+  TOKEN_FILE="${INSTALL_DIR}/token"
+  WSL_TOKEN="$(cat "$TOKEN_FILE" 2>/dev/null || true)"
+  if ! [[ "$WSL_TOKEN" =~ ^wsl_[0-9a-f]{64}$ ]]; then
+    WSL_TOKEN="wsl_$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
+    (umask 077; printf '%s' "$WSL_TOKEN" > "$TOKEN_FILE")
+  fi
+  chmod 600 "$TOKEN_FILE"
+fi
+
+# Printed directly (not captured with $(...)): bash 3.2 misparses quotes in
+# heredocs inside command substitutions.
+_pair_steps() {
+  if [ "$IS_WSL" = "1" ]; then
+    cat <<EOF
+  5. Pair the extension (needed once under WSL): click the Chromanche
+     icon, open "Advanced — override pairing", enter
+       Port:   ${WSL_PORT}
+       Token:  ${WSL_TOKEN}
+     and click "Save override". The token is kept in ${TOKEN_FILE}
+     and stays the same when you re-run this installer.
+  6. Start a registered MCP client (see above) and try:
+       "open https://example.com in a new tab and tell me the title"
+EOF
+  else
+    cat <<EOF
+  5. Start a registered MCP client (see above) and try:
+       "open https://example.com in a new tab and tell me the title"
+
+  Pairing is automatic — the extension and MCP server derive a matching
+  token and port from your timezone + OS. No paste needed. If you ever
+  need to override (port conflict, multi-user workstation), set
+  CHROMANCHE_TOKEN / CHROMANCHE_PORT on the server and paste matching
+  values in the extension popup's advanced section.
+EOF
+  fi
+}
+
 cat <<EOF
 
 ------------------------------------------------------------------
@@ -544,28 +588,9 @@ ${CLIENTS_SUMMARY}
   3. Click "Load unpacked" and select:
        ${LOAD_DIR}
   4. Pin the Chromanche toolbar icon (puzzle-piece menu → pin)
-  5. Start a registered MCP client (see above) and try:
-       "open https://example.com in a new tab and tell me the title"
-
-  Pairing is automatic — the extension and MCP server derive a matching
-  token and port from your timezone + OS. No paste needed. If you ever
-  need to override (port conflict, multi-user workstation), set
-  CHROMANCHE_TOKEN / CHROMANCHE_PORT on the server and paste matching
-  values in the extension popup's advanced section.
-
 EOF
-
-if [ "$IS_WSL" = "1" ]; then
-  cat <<EOF
-  WSL: the MCP server runs here in WSL and pairs with Chrome on Windows
-  by itself: it detects WSL, derives the Windows-side pairing, and WSL's
-  default localhost forwarding carries the connection (no mirrored
-  networking needed). If you run Chromium inside WSL instead, load
-  ${EXT_DIR} there and set CHROMANCHE_BROWSER_PLATFORM=linux in the
-  MCP server's environment (see the README).
-
-EOF
-fi
+_pair_steps
+echo
 
 if [ "$OPENCODE_STATUS" = "manual" ]; then
   _warn "OpenCode is installed but Chromanche isn't registered with it yet: add the snippet printed above to ${OC_CFG}, or install jq and re-run this installer."

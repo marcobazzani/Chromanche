@@ -16,8 +16,9 @@
       <summary>Advanced — override pairing</summary>
       <p class="hint">
         Token and port are normally derived automatically and match the MCP server.
-        Only fill these in if you've set <code>CHROMANCHE_TOKEN</code> or
-        <code>CHROMANCHE_PORT</code> on the server side.
+        Fill these in if the MCP server runs in WSL (the installer prints the values;
+        the token is in <code>~/.chromanche/token</code> inside WSL) or if you've set
+        <code>CHROMANCHE_TOKEN</code> / <code>CHROMANCHE_PORT</code> on the server side.
       </p>
       <label>Port:
         <input id="port" type="number" min="1" max="65535" step="1" placeholder="auto" />

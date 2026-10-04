@@ -85,6 +85,19 @@ describe("tool adapters", () => {
     await expect(tools.tabs_list.handler({})).rejects.toThrow(/extension/i);
   });
 
+  it("appends the configured pairing help (WSL) to the no-extension error", async () => {
+    const { bridge } = fakeBridge();
+    (bridge as any).isConnected = () => false;
+    const tools = buildTools(bridge, { notConnectedHelp: "Pair by hand: set Port to 48765" });
+    await expect(tools.page_navigate.handler({ tabId: 1, url: "https://example.com" })).rejects.toThrow(
+      /^no extension connected[^\n]*\n\nPair by hand: set Port to 48765$/,
+    );
+    // page_batch guards up front too, so batches surface the same help.
+    await expect(tools.page_batch.handler({ steps: [{ tool: "tabs_list", args: {} }] } as any)).rejects.toThrow(
+      /Pair by hand: set Port to 48765/,
+    );
+  });
+
   it("tabs_create auto-claims the newly created tab", async () => {
     const { bridge, calls } = fakeBridge();
     const tools = buildTools(bridge);

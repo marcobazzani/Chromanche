@@ -25,7 +25,7 @@ The default `page_snapshot` mode returns a **CDP accessibility tree with stable 
 
 **Multi-profile (v0.6.0+):** install the extension in multiple Chrome profiles — each generates a stable tag derived from `chrome.runtime.id`. Connected profiles appear in `chromanche_list_profiles`; pass `profile: "<tag>"` on any tool call to target a specific one. When exactly one profile is connected, the `profile` field is optional (auto-routes). When multiple are connected and the field is omitted, the tool returns a structured error with the list. Each Chrome profile can set a human-readable label in the extension popup.
 
-**Zero-config pairing (v0.5.0+):** the MCP server and the extension both derive the same WebSocket port and auth token from `sha256(timezone + platform + salt)`. No copy-paste, no port config. The platform is the browser's: a server running under WSL pairs as Windows, since that's where Chrome usually runs (override with `CHROMANCHE_BROWSER_PLATFORM`). Set `CHROMANCHE_TOKEN` / `CHROMANCHE_PORT` on the server and paste matching values into the extension popup's advanced section if you need to override.
+**Zero-config pairing (v0.5.0+):** the MCP server and the extension both derive the same WebSocket port and auth token from `sha256(timezone + platform + salt)`. No copy-paste, no port config (except under WSL, see below). Set `CHROMANCHE_TOKEN` / `CHROMANCHE_PORT` on the server and paste matching values into the extension popup's advanced section if you need to override.
 
 **Note on concurrent MCP sessions:** one session becomes the local WebSocket leader; concurrent sessions that hit the same derived port join it through the built-in proxy path. This lets multiple MCP clients or client sessions share the same connected extension without manual port changes.
 
@@ -48,15 +48,10 @@ curl -fsSL https://raw.githubusercontent.com/marcobazzani/Chromanche/main/script
 
 Then load the extension as unpacked. No token paste — pairing happens automatically the first time your MCP client launches the server.
 
-**Windows (agent in WSL, Chrome on Windows):** run the installer inside WSL. It registers the MCP server with the CLIs installed in WSL and copies the extension to `%USERPROFILE%\.chromanche\extension`; load that folder in Chrome. Pairing still needs no configuration: the server detects WSL and derives the Windows-side pairing, and WSL2's default localhost forwarding carries the extension's connection to the server, which still binds `127.0.0.1` only. Mirrored networking is not needed.
+**Windows (agent in WSL, Chrome on Windows):** run the installer inside WSL. It registers the MCP server with the CLIs installed in WSL and copies the extension to `%USERPROFILE%\.chromanche\extension`; load that folder in Chrome. Automatic pairing is off under WSL (WSL and Chrome on Windows often see different timezones), so pair once by hand: in the extension popup, open **Advanced — override pairing** and enter port `48765` and the token the installer printed (it's also in `~/.chromanche/token` inside WSL; it stays the same across re-installs). The server still binds `127.0.0.1` only; Chrome reaches it through WSL2's localhost forwarding (on by default) or mirrored networking.
 
-- **Chromium inside WSL (WSLg) instead?** Load `~/.chromanche/extension` in that browser and tell the server to pair as Linux:
-  ```bash
-  claude mcp remove chromanche --scope user
-  claude mcp add chromanche --scope user -e CHROMANCHE_BROWSER_PLATFORM=linux -- node ~/.chromanche/mcp-server/dist/index.cjs
-  ```
-  (Other MCP clients: add `CHROMANCHE_BROWSER_PLATFORM=linux` to the server entry's `env`.)
-- **Nothing connects?** After 15 s without an extension, the server prints troubleshooting steps to its log. The usual causes: the popup shows a different port than the server's log (the two sides see different timezones), `Test-NetConnection 127.0.0.1 -Port <port>` fails in PowerShell (WSL isn't forwarding; check `localhostForwarding` in `%UserProfile%\.wslconfig`), or the port falls in a range listed by `netsh interface ipv4 show excludedportrange protocol=tcp` (Windows reserved it; set `CHROMANCHE_PORT` on the server and the same port in the popup).
+- **Nothing connects?** Tools return the pairing steps while no extension is connected. Check that the popup says port `48765` and the token matches `cat ~/.chromanche/token`, then that `Test-NetConnection 127.0.0.1 -Port 48765` succeeds in PowerShell (if not, check `localhostForwarding` in `%UserProfile%\.wslconfig`).
+- **Chromium inside WSL (WSLg) instead?** Same pairing steps, in that browser's extension popup.
 
 **Windows without WSL:** do it by hand — download the latest `chromanche-extension-*.zip` + `chromanche-mcp-server-*.tgz` from [Releases](https://github.com/marcobazzani/Chromanche/releases), unpack to `%USERPROFILE%\.chromanche\`, then register the MCP server per the installer's printed instructions.
 

@@ -105,10 +105,12 @@ function text(value: unknown): ToolResult {
   return { content: [{ type: "text", text: JSON.stringify(value, null, 2) }] };
 }
 
-function guard(bridge: Pick<BridgeServer, "isConnected">) {
+/** Throws when no extension is connected; `help` (e.g. WSL manual pairing steps) is appended to the error. */
+export function assertConnected(bridge: Pick<BridgeServer, "isConnected">, help?: string) {
   if (!bridge.isConnected()) {
     throw new Error(
-      "no extension connected — install and enable the Chromanche Chrome extension on at least one Chrome profile",
+      "no extension connected — install and enable the Chromanche Chrome extension on at least one Chrome profile" +
+        (help ? `\n\n${help}` : ""),
     );
   }
 }
@@ -151,7 +153,13 @@ function redactOversizedBase64(value: unknown): unknown {
   return value;
 }
 
-export function buildTools(bridge: BridgeServer) {
+export interface BuildToolsOptions {
+  /** Appended to "no extension connected" errors (under WSL: how to pair by hand). */
+  notConnectedHelp?: string | undefined;
+}
+
+export function buildTools(bridge: BridgeServer, opts: BuildToolsOptions = {}) {
+  const guard = (b: Pick<BridgeServer, "isConnected">) => assertConnected(b, opts.notConnectedHelp);
   // Per-profile claim set: a tabId only makes sense within a single Chrome instance.
   const claimed = new Set<string>();
   async function ensureClaim(tabId: number, profile?: string) {
