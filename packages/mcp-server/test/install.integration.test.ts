@@ -456,6 +456,45 @@ describe("install.sh under WSL", () => {
   });
 });
 
+describe("install.sh MCP client summary", () => {
+  const row = (label: string, text: string) => `    ${label.padEnd(20)} ${text}\n`;
+
+  it("says where Chromanche got registered and why the other clients were skipped, without warnings", () => {
+    writeFakeCommand("claude");
+
+    const { stdout, stderr } = runCapture();
+
+    expect(stdout).toContain(`  MCP clients:\n${row("Claude Code", "registered")}`);
+    expect(stdout).toContain(row("Codex", "skipped: 'codex' is not installed (only needed if you use Codex)"));
+    expect(stdout).toContain(row("OpenCode", "skipped: 'opencode' is not installed (only needed if you use OpenCode)"));
+    expect(stdout).toContain(
+      row("GitHub Copilot CLI", "skipped: 'copilot' is not installed (only needed if you use GitHub Copilot CLI)"),
+    );
+    expect(stdout).toContain("Install one of them later? Re-run this installer and it gets registered too.");
+    // A client you don't use is not a problem: no warnings, no hand-edit snippets.
+    expect(stderr).not.toContain("!!");
+    expect(stdout + stderr).not.toContain("config.toml");
+    expect(stdout + stderr).not.toContain("settings.json");
+  });
+
+  it("lists every client as registered when all are installed, with no 're-run' hint", () => {
+    for (const cli of ["claude", "codex", "opencode", "copilot"]) writeFakeCommand(cli);
+
+    const { stdout } = runCapture();
+
+    for (const label of ["Claude Code", "Codex", "OpenCode", "GitHub Copilot CLI"]) {
+      expect(stdout).toContain(row(label, "registered"));
+    }
+    expect(stdout).not.toContain("Re-run this installer");
+  });
+
+  it("warns when no MCP client is installed at all", () => {
+    const { stderr } = runCapture();
+
+    expect(stderr).toContain("No MCP client was found, so Chromanche isn't registered anywhere yet.");
+  });
+});
+
 describe("install.sh Node.js provisioning", () => {
   const entry = () => join(home, ".chromanche", "mcp-server", "dist", "index.cjs");
   const log = () => (existsSync(commandLog) ? readFileSync(commandLog, "utf8") : "");
@@ -475,7 +514,7 @@ describe("install.sh Node.js provisioning", () => {
     linux();
     writeOldSystemNode();
     const dist = makeNodeDist();
-    for (const cli of ["claude", "opencode", "copilot", "sudo"]) writeFakeCommand(cli);
+    for (const cli of ["claude", "codex", "opencode", "copilot", "sudo"]) writeFakeCommand(cli);
 
     const { stdout } = runCapture({ CHROMANCHE_NODE_DIST_URL: dist.url });
 
@@ -485,9 +524,9 @@ describe("install.sh Node.js provisioning", () => {
     expect(existsSync(join(home, ".chromanche", ".node-staging"))).toBe(false);
     // Every MCP client gets the absolute path: the private node is not on PATH.
     expect(log()).toContain(`claude mcp add chromanche --scope user -- ${privateNode()} ${entry()}`);
+    expect(log()).toContain(`codex mcp add chromanche -- ${privateNode()} ${entry()}`);
     expect(readJson(opencodeCfg()).mcp.chromanche.command).toEqual([privateNode(), entry()]);
     expect(readJson(copilotCfg()).mcpServers.chromanche.command).toBe(privateNode());
-    expect(stdout).toContain(`command = "${privateNode()}"`); // Codex manual instructions
     expect(stdout).toContain(`Node.js:     ${privateNode()} (v22.99.0, private to Chromanche, not on your PATH)`);
     expect(log()).not.toMatch(/^sudo /m);
   });

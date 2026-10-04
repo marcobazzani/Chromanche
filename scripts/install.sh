@@ -364,12 +364,18 @@ if [ "$IS_WSL" = "1" ]; then
   fi
 fi
 
-# --- Register with Claude Code ----------------------------------------------
+# --- Register with MCP clients -----------------------------------------------
+# Each client ends up "registered", "missing" (its CLI isn't installed: fine
+# unless the user uses it; re-running this installer registers it later) or
+# "manual" (installed, but we couldn't edit its config). The summary at the
+# end explains each one.
 ENTRY="${SERVER_DIR}/dist/index.cjs"
 if [ ! -f "$ENTRY" ]; then
   _die "MCP server entrypoint not found at $ENTRY — install layout may have changed."
 fi
 
+# --- Claude Code --------------------------------------------------------------
+CLAUDE_STATUS="missing"
 if command -v claude >/dev/null 2>&1; then
   _note "Registering MCP server with Claude Code (user scope) as '${MCP_NAME}'..."
   if claude mcp list 2>/dev/null | grep -q "^${MCP_NAME}"; then
@@ -378,21 +384,6 @@ if command -v claude >/dev/null 2>&1; then
   fi
   claude mcp add "${MCP_NAME}" --scope user -- "$NODE_CMD" "$ENTRY"
   CLAUDE_STATUS="registered"
-else
-  _warn "'claude' CLI not found on PATH. Add this manually to ~/.claude/settings.json:"
-  cat <<EOF
-
-{
-  "mcpServers": {
-    "${MCP_NAME}": {
-      "command": "${NODE_CMD}",
-      "args": ["${ENTRY}"]
-    }
-  }
-}
-
-EOF
-  CLAUDE_STATUS="manual"
 fi
 
 # --- Register with OpenCode -------------------------------------------------
@@ -403,7 +394,7 @@ fi
 XDG_CFG_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}"
 OC_CFG="${XDG_CFG_HOME}/opencode/opencode.json"
 OC_LEGACY_CFG="${HOME}/.opencode/config.json"
-OPENCODE_STATUS="skip"
+OPENCODE_STATUS="missing"
 if command -v opencode >/dev/null 2>&1; then
   if command -v jq >/dev/null 2>&1; then
     _note "Registering MCP server with OpenCode (${OC_CFG})..."
@@ -431,7 +422,7 @@ if command -v opencode >/dev/null 2>&1; then
     fi
     OPENCODE_STATUS="registered"
   else
-    _warn "'jq' not found — cannot auto-update OpenCode config. Add manually to ${OC_CFG}:"
+    _warn "OpenCode is installed, but 'jq' is missing, so its config can't be edited automatically. Add this to ${OC_CFG}:"
     cat <<EOF
 
 {
@@ -451,7 +442,7 @@ EOF
 fi
 
 # --- Register with Codex ----------------------------------------------------
-CODEX_STATUS="skip"
+CODEX_STATUS="missing"
 if command -v codex >/dev/null 2>&1; then
   _note "Registering MCP server with Codex as '${MCP_NAME}'..."
   if codex mcp list 2>/dev/null | grep -q "^${MCP_NAME}[[:space:]]"; then
@@ -460,21 +451,11 @@ if command -v codex >/dev/null 2>&1; then
   fi
   codex mcp add "${MCP_NAME}" -- "$NODE_CMD" "$ENTRY"
   CODEX_STATUS="registered"
-else
-  _warn "'codex' CLI not found on PATH. Add this manually to ~/.codex/config.toml:"
-  cat <<EOF
-
-[mcp_servers.${MCP_NAME}]
-command = "${NODE_CMD}"
-args = ["${ENTRY}"]
-
-EOF
-  CODEX_STATUS="manual"
 fi
 
 # --- Register with GitHub Copilot CLI ---------------------------------------
 GH_CFG="${HOME}/.copilot/mcp-config.json"
-COPILOT_STATUS="skip"
+COPILOT_STATUS="missing"
 if command -v copilot >/dev/null 2>&1; then
   if command -v jq >/dev/null 2>&1; then
     _note "Registering MCP server with GitHub Copilot CLI..."
@@ -498,7 +479,7 @@ if command -v copilot >/dev/null 2>&1; then
     fi
     COPILOT_STATUS="registered"
   else
-    _warn "'jq' not found — cannot auto-update Copilot config. Add manually to ${GH_CFG}:"
+    _warn "GitHub Copilot CLI is installed, but 'jq' is missing, so its config can't be edited automatically. Add this to ${GH_CFG}:"
     cat <<EOF
 
 {
@@ -525,6 +506,25 @@ NODE_LINE=""
 if [ "$PRIVATE_NODE" = "1" ]; then
   NODE_LINE=$'\n'"  Node.js:     ${NODE_CMD} ($("$NODE_CMD" -v 2>/dev/null || true), private to Chromanche, not on your PATH)"
 fi
+
+# One line per MCP client: where Chromanche is available, and why not elsewhere.
+_client_status() { # <label> <status> <cli> <config file for manual edits>
+  case "$2" in
+    registered) printf '    %-20s registered\n' "$1" ;;
+    missing) printf "    %-20s skipped: '%s' is not installed (only needed if you use %s)\n" "$1" "$3" "$1" ;;
+    manual) printf '    %-20s NOT registered: jq is missing; add the snippet printed above to %s\n' "$1" "$4" ;;
+  esac
+}
+CLIENTS_SUMMARY="$(
+  _client_status "Claude Code" "$CLAUDE_STATUS" claude ""
+  _client_status "Codex" "$CODEX_STATUS" codex ""
+  _client_status "OpenCode" "$OPENCODE_STATUS" opencode "$OC_CFG"
+  _client_status "GitHub Copilot CLI" "$COPILOT_STATUS" copilot "$GH_CFG"
+)"
+case " $CLAUDE_STATUS $CODEX_STATUS $OPENCODE_STATUS $COPILOT_STATUS " in
+  *" missing "*) CLIENTS_SUMMARY="${CLIENTS_SUMMARY}"$'\n'"    Install one of them later? Re-run this installer and it gets registered too." ;;
+esac
+
 cat <<EOF
 
 ------------------------------------------------------------------
@@ -534,6 +534,9 @@ cat <<EOF
   Extension:   ${EXT_DIR}${WIN_COPY_LINE}
   MCP server:  ${ENTRY}${NODE_LINE}
 
+  MCP clients:
+${CLIENTS_SUMMARY}
+
   Next steps:
 
   1. Open chrome://extensions
@@ -541,7 +544,7 @@ cat <<EOF
   3. Click "Load unpacked" and select:
        ${LOAD_DIR}
   4. Pin the Chromanche toolbar icon (puzzle-piece menu → pin)
-  5. Start Claude Code, Codex, OpenCode, or GitHub Copilot CLI and try:
+  5. Start a registered MCP client (see above) and try:
        "open https://example.com in a new tab and tell me the title"
 
   Pairing is automatic — the extension and MCP server derive a matching
@@ -564,15 +567,13 @@ if [ "$IS_WSL" = "1" ]; then
 EOF
 fi
 
-if [ "$CLAUDE_STATUS" = "manual" ]; then
-  _warn "You still need to add the MCP server entry to ~/.claude/settings.json (see above)."
-fi
 if [ "$OPENCODE_STATUS" = "manual" ]; then
-  _warn "You still need to add the MCP server entry to ${OC_CFG} (see above)."
-fi
-if [ "$CODEX_STATUS" = "manual" ]; then
-  _warn "You still need to add the MCP server entry to ~/.codex/config.toml (see above)."
+  _warn "OpenCode is installed but Chromanche isn't registered with it yet: add the snippet printed above to ${OC_CFG}, or install jq and re-run this installer."
 fi
 if [ "$COPILOT_STATUS" = "manual" ]; then
-  _warn "You still need to add the MCP server entry to ${GH_CFG} (see above)."
+  _warn "GitHub Copilot CLI is installed but Chromanche isn't registered with it yet: add the snippet printed above to ${GH_CFG}, or install jq and re-run this installer."
 fi
+case " $CLAUDE_STATUS $CODEX_STATUS $OPENCODE_STATUS $COPILOT_STATUS " in
+  *" registered "*|*" manual "*) ;;
+  *) _warn "No MCP client was found, so Chromanche isn't registered anywhere yet. Install Claude Code (or Codex, OpenCode, GitHub Copilot CLI), then re-run this installer." ;;
+esac
