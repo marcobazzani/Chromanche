@@ -7,9 +7,10 @@ import {
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { BridgeServer } from "./bridge.js";
 import { buildTools } from "./tools.js";
-import { loadConfig, type Config } from "./config.js";
+import { describePairing, loadConfig, type Config } from "./config.js";
 import { runProxy } from "./proxy.js";
 import { WebSocketServerTransport } from "./ws-transport.js";
+import { scheduleWslConnectHint } from "./wsl-hint.js";
 
 /** Build a fresh MCP Server wired to our tool set. One per stdio or proxy session. */
 function buildMcpServer(bridge: BridgeServer): Server {
@@ -47,6 +48,18 @@ async function runLeader(cfg: Config): Promise<void> {
     `[chromanche] leader on ws://127.0.0.1:${cfg.port}. Token: ${cfg.token.slice(0, 8)}... (${mode}; file: ${cfg.tokenFile})`,
   );
 
+  // Under WSL the extension arrives via Windows→WSL localhost forwarding. If
+  // nothing shows up, tell the user which hop to check instead of failing silently.
+  if (cfg.pairing.source === "wsl") {
+    const cancelHint = scheduleWslConnectHint({
+      delayMs: cfg.wslHintMs,
+      port: cfg.port,
+      timezone: cfg.pairing.timezone,
+      log: (msg) => console.error(msg),
+    });
+    bridge.onExtensionConnected(cancelHint);
+  }
+
   // Accept follower Claude Code sessions via WS proxy handshake.
   bridge.setProxyHandler((ws) => {
     const server = buildMcpServer(bridge);
@@ -72,6 +85,7 @@ async function runLeader(cfg: Config): Promise<void> {
 
 async function main(): Promise<void> {
   const cfg = await loadConfig();
+  console.error(describePairing(cfg.pairing));
   const flags = new Set(process.argv.slice(2));
 
   // Explicit proxy mode: never bind, just join whoever's the leader.

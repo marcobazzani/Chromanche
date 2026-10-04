@@ -78,10 +78,19 @@ export class BridgeServer {
   private token: string;
   private timeoutMs: number;
   private proxyHandler?: ProxyHandler;
+  private connectedListeners: Array<(profile: string) => void> = [];
 
   constructor(opts: { token: string; timeoutMs: number }) {
     this.token = opts.token;
     this.timeoutMs = opts.timeoutMs;
+  }
+
+  /**
+   * Invoked every time an extension authenticates (not for proxy sessions or
+   * rejected tokens). Lets the leader cancel its "nothing connected" hint.
+   */
+  onExtensionConnected(listener: (profile: string) => void): void {
+    this.connectedListeners.push(listener);
   }
 
   /**
@@ -183,6 +192,13 @@ export class BridgeServer {
           nextId: 1,
         };
         this.extensions.set(profile, entry);
+        for (const listener of this.connectedListeners) {
+          try {
+            listener(profile);
+          } catch (err) {
+            console.error("[chromanche] extension-connected listener error:", err);
+          }
+        }
         return;
       }
       // Keepalive frame from the extension — ignore. Receiving any frame resets

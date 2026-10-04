@@ -65,4 +65,37 @@ if [ -d "$LEGACY_DIR" ]; then
   rm -rf "$LEGACY_DIR"
 fi
 
+# Under WSL, install.sh also mirrors the extension into the Windows profile.
+# Remove only that copy: %USERPROFILE%\.chromanche may also hold a native
+# Windows install, which is not ours to delete.
+IS_WSL=0
+if [ "$(uname -s 2>/dev/null || echo unknown)" = "Linux" ]; then
+  KERNEL_RELEASE="$(uname -r 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
+  case "$KERNEL_RELEASE" in *microsoft*|*wsl*) IS_WSL=1 ;; esac
+  if [ -n "${WSL_DISTRO_NAME:-}" ] || [ -n "${WSL_INTEROP:-}" ]; then IS_WSL=1; fi
+fi
+
+# Same helper as install.sh (kept inline: both scripts must work when piped from curl).
+_wsl_windows_home() {
+  command -v cmd.exe >/dev/null 2>&1 || return 0
+  local out
+  out="$(cd /mnt/c 2>/dev/null || true; cmd.exe /d /c 'echo %USERPROFILE%' 2>/dev/null | tr -d '\r' | tail -n 1)" || out=""
+  case "$out" in
+    [A-Za-z]:\\*) printf '%s' "$out" ;;
+  esac
+}
+
+if [ "$IS_WSL" = "1" ]; then
+  WIN_HOME="$(_wsl_windows_home)"
+  WIN_HOME_UNIX=""
+  if [ -n "$WIN_HOME" ] && command -v wslpath >/dev/null 2>&1; then
+    WIN_HOME_UNIX="$(wslpath -u "$WIN_HOME" 2>/dev/null || true)"
+  fi
+  if [ -n "$WIN_HOME_UNIX" ] && [ -d "${WIN_HOME_UNIX}/.chromanche/extension" ]; then
+    echo "==> Removing ${WIN_HOME}\\.chromanche\\extension"
+    rm -rf "${WIN_HOME_UNIX}/.chromanche/extension"
+    rmdir "${WIN_HOME_UNIX}/.chromanche" 2>/dev/null || true
+  fi
+fi
+
 echo "==> Done. Also remove the Chromanche and legacy BrowserUse extensions from chrome://extensions."

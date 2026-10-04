@@ -42,6 +42,28 @@ case "$OS" in
   *) _die "Unsupported OS: $OS. Install manually per the README." ;;
 esac
 
+# WSL: the MCP server runs in Linux, but the browser is usually Chrome on
+# Windows. Same markers as the server's isWsl(): the env vars are set in WSL
+# shells; the kernel release string covers the rest.
+IS_WSL=0
+if [ "$OS" = "Linux" ]; then
+  KERNEL_RELEASE="$(uname -r 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
+  case "$KERNEL_RELEASE" in *microsoft*|*wsl*) IS_WSL=1 ;; esac
+  if [ -n "${WSL_DISTRO_NAME:-}" ] || [ -n "${WSL_INTEROP:-}" ]; then IS_WSL=1; fi
+fi
+
+# Print the Windows user profile as a drive path (C:\Users\me), or nothing if
+# WSL interop is unavailable. /d skips cmd.exe AutoRun hooks that could print
+# noise; starting from /mnt/c avoids the "UNC paths are not supported" banner.
+_wsl_windows_home() {
+  command -v cmd.exe >/dev/null 2>&1 || return 0
+  local out
+  out="$(cd /mnt/c 2>/dev/null || true; cmd.exe /d /c 'echo %USERPROFILE%' 2>/dev/null | tr -d '\r' | tail -n 1)" || out=""
+  case "$out" in
+    [A-Za-z]:\\*) printf '%s' "$out" ;;
+  esac
+}
+
 # --- Dependencies ------------------------------------------------------------
 for cmd in curl tar node; do
   command -v "$cmd" >/dev/null 2>&1 || _die "'$cmd' is required but not installed."
@@ -163,6 +185,33 @@ else
   rm -rf "$SERVER_DIR"
   mkdir -p "$SERVER_DIR"
   tar -xzf "${TMP}/mcp-server.tgz" -C "$SERVER_DIR"
+fi
+
+# --- WSL: make the extension loadable by Chrome on Windows -------------------
+# Mirror the extension into the Windows profile so Chrome loads it from a
+# plain drive path instead of the Linux filesystem. The MCP server stays in
+# WSL: Chrome on Windows reaches its 127.0.0.1 listener through WSL's default
+# localhost forwarding.
+LOAD_DIR="$EXT_DIR"
+if [ "$IS_WSL" = "1" ]; then
+  WIN_HOME="$(_wsl_windows_home)"
+  WIN_HOME_UNIX=""
+  if [ -n "$WIN_HOME" ] && command -v wslpath >/dev/null 2>&1; then
+    WIN_HOME_UNIX="$(wslpath -u "$WIN_HOME" 2>/dev/null || true)"
+  fi
+  if [ -n "$WIN_HOME_UNIX" ] && [ -d "$WIN_HOME_UNIX" ]; then
+    WIN_EXT_DIR="${WIN_HOME_UNIX}/.chromanche/extension"
+    LOAD_DIR="${WIN_HOME}\\.chromanche\\extension"
+    _note "WSL detected: copying the extension to ${LOAD_DIR} for Chrome on Windows"
+    rm -rf "$WIN_EXT_DIR"
+    mkdir -p "$WIN_EXT_DIR"
+    cp -R "${EXT_DIR}/." "$WIN_EXT_DIR/"
+  else
+    UNC_EXT_DIR="$(printf '\\\\wsl.localhost\\%s%s' "${WSL_DISTRO_NAME:-<distro>}" "$(printf '%s' "$EXT_DIR" | tr '/' '\\')")"
+    _warn "WSL detected, but your Windows user folder could not be located (is WSL interop enabled?)."
+    _warn "Copy ${UNC_EXT_DIR} to a Windows folder and load that folder in Chrome."
+    LOAD_DIR="the Windows folder you copied ${UNC_EXT_DIR} to"
+  fi
 fi
 
 # --- Register with Claude Code ----------------------------------------------
@@ -318,13 +367,17 @@ EOF
 fi
 
 # --- Final instructions ------------------------------------------------------
+WIN_COPY_LINE=""
+if [ -n "${WIN_EXT_DIR:-}" ]; then
+  WIN_COPY_LINE=$'\n'"  Windows copy: ${LOAD_DIR}"
+fi
 cat <<EOF
 
 ------------------------------------------------------------------
   Chromanche ${DISPLAY_VERSION} installed.
 ------------------------------------------------------------------
 
-  Extension:   ${EXT_DIR}
+  Extension:   ${EXT_DIR}${WIN_COPY_LINE}
   MCP server:  ${ENTRY}
 
   Next steps:
@@ -332,7 +385,7 @@ cat <<EOF
   1. Open chrome://extensions
   2. Enable "Developer mode" (top-right toggle)
   3. Click "Load unpacked" and select:
-       ${EXT_DIR}
+       ${LOAD_DIR}
   4. Pin the Chromanche toolbar icon (puzzle-piece menu → pin)
   5. Start Claude Code, Codex, OpenCode, or GitHub Copilot CLI and try:
        "open https://example.com in a new tab and tell me the title"
@@ -344,6 +397,18 @@ cat <<EOF
   values in the extension popup's advanced section.
 
 EOF
+
+if [ "$IS_WSL" = "1" ]; then
+  cat <<EOF
+  WSL: the MCP server runs here in WSL and pairs with Chrome on Windows
+  by itself: it detects WSL, derives the Windows-side pairing, and WSL's
+  default localhost forwarding carries the connection (no mirrored
+  networking needed). If you run Chromium inside WSL instead, load
+  ${EXT_DIR} there and set CHROMANCHE_BROWSER_PLATFORM=linux in the
+  MCP server's environment (see the README).
+
+EOF
+fi
 
 if [ "$CLAUDE_STATUS" = "manual" ]; then
   _warn "You still need to add the MCP server entry to ~/.claude/settings.json (see above)."
