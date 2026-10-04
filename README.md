@@ -33,7 +33,8 @@ Every interactive tool auto-claims its target tab: the tab is put into a distinc
 
 ## Requirements
 
-- Node 20+
+- Node 20+. If it's missing or older, the installer downloads the official Node.js 22 build into `~/.chromanche/node` (no sudo, SHA-256 checked, not added to your PATH) and points the MCP registrations at it.
+- `curl` and `tar` for the installer (`unzip` is used when present, but not required)
 - A Chromium-based browser (Chrome, Edge, Brave, Arc) — 116+
 - Claude Code, Codex, OpenCode, GitHub Copilot CLI, or another MCP-capable client
 

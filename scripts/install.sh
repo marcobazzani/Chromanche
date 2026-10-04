@@ -65,26 +65,174 @@ _wsl_windows_home() {
 }
 
 # --- Dependencies ------------------------------------------------------------
-for cmd in curl tar node; do
+# Only curl and tar are hard requirements: Node is installed below when
+# missing, and zips can be extracted without unzip.
+for cmd in curl tar; do
   command -v "$cmd" >/dev/null 2>&1 || _die "'$cmd' is required but not installed."
 done
-command -v unzip >/dev/null 2>&1 || _die "'unzip' is required but not installed."
 
-NODE_MAJOR="$(node -e 'console.log(process.versions.node.split(".")[0])')"
-if [ "$NODE_MAJOR" -lt 20 ]; then
-  _die "Node 20+ required (found $(node -v)). Upgrade and re-run."
-fi
-
-# --- Download + unpack -------------------------------------------------------
 TMP="$(mktemp -d -t chromanche-install.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
+trap 'rm -rf "$TMP" "${INSTALL_DIR}/.node-staging"' EXIT
 
 mkdir -p "$INSTALL_DIR"
 
+# --- Node.js -----------------------------------------------------------------
+# The MCP server needs Node 20+. Use the system node when it is new enough.
+# Otherwise download the official Node.js build into ~/.chromanche/node: no
+# sudo, no package manager, any glibc Linux distro (incl. WSL) or macOS. MCP
+# clients are then registered with its absolute path, so it never has to be
+# on PATH, and uninstall.sh removes it with the rest of ~/.chromanche.
+NODE_MIN_MAJOR=20
+NODE_INSTALL_MAJOR=22
+NODE_DIR="${INSTALL_DIR}/node"
+# Mirror override (also the integration-test hook): a base URL laid out like
+# https://nodejs.org/dist/latest-v22.x/ (SHASUMS256.txt next to the tarballs).
+NODE_DIST="${CHROMANCHE_NODE_DIST_URL:-https://nodejs.org/dist/latest-v${NODE_INSTALL_MAJOR}.x}"
+NODE_CMD="node"
+PRIVATE_NODE=0
+
+_node_usable() {
+  local major
+  major="$("$1" -e 'console.log(process.versions.node.split(".")[0])' 2>/dev/null || true)"
+  case "$major" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$major" -ge "$NODE_MIN_MAJOR" ]
+}
+
+_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+_install_private_node() {
+  local os arch machine tarball version expected actual staging
+  case "$OS" in
+    Darwin) os="darwin" ;;
+    *) os="linux" ;;
+  esac
+  machine="$(uname -m 2>/dev/null || echo unknown)"
+  case "$machine" in
+    x86_64|amd64) arch="x64" ;;
+    aarch64|arm64) arch="arm64" ;;
+    armv7l) arch="armv7l" ;;
+    ppc64le) arch="ppc64le" ;;
+    s390x) arch="s390x" ;;
+    *) _die "No official Node.js build for '${machine}'. Install Node ${NODE_MIN_MAJOR}+ yourself and re-run." ;;
+  esac
+  command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 \
+    || _die "Need sha256sum or shasum to verify the Node.js download."
+
+  if ! curl -fsSL -o "${TMP}/SHASUMS256.txt" "${NODE_DIST}/SHASUMS256.txt" 2>/dev/null; then
+    if [ -x "${NODE_DIR}/bin/node" ] && _node_usable "${NODE_DIR}/bin/node"; then
+      _warn "Could not reach ${NODE_DIST} to check for Node.js updates; keeping $("${NODE_DIR}/bin/node" -v)."
+      NODE_CMD="${NODE_DIR}/bin/node"
+      return 0
+    fi
+    _die "Could not download Node.js from ${NODE_DIST}. Install Node ${NODE_MIN_MAJOR}+ yourself and re-run."
+  fi
+  tarball="$(grep -oE "node-v[0-9]+\.[0-9]+\.[0-9]+-${os}-${arch}\.tar\.gz" "${TMP}/SHASUMS256.txt" | head -n 1 || true)"
+  [ -n "$tarball" ] \
+    || _die "No Node.js ${NODE_INSTALL_MAJOR} build for ${os}-${arch} at ${NODE_DIST}. Install Node ${NODE_MIN_MAJOR}+ yourself and re-run."
+  version="${tarball#node-}"
+  version="${version%%-*}"
+
+  if [ -x "${NODE_DIR}/bin/node" ] && [ "$("${NODE_DIR}/bin/node" -v 2>/dev/null || true)" = "$version" ]; then
+    _note "Using Chromanche's Node.js ${version} (${NODE_DIR})"
+    NODE_CMD="${NODE_DIR}/bin/node"
+    return 0
+  fi
+
+  _note "Installing Node.js ${version} for Chromanche into ${NODE_DIR} (no sudo)..."
+  curl -fsSL -o "${TMP}/${tarball}" "${NODE_DIST}/${tarball}" \
+    || _die "Could not download ${NODE_DIST}/${tarball}. Install Node ${NODE_MIN_MAJOR}+ yourself and re-run."
+  expected="$(awk -v f="$tarball" '$2 == f { print $1 }' "${TMP}/SHASUMS256.txt")"
+  actual="$(_sha256 "${TMP}/${tarball}")"
+  if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+    _die "Checksum mismatch for ${tarball} (expected ${expected:-nothing}, got ${actual}). Not installing it."
+  fi
+
+  # Stage inside INSTALL_DIR (/tmp may be mounted noexec) and swap it in only
+  # once the binary has proven it runs here.
+  staging="${INSTALL_DIR}/.node-staging"
+  rm -rf "$staging"
+  mkdir -p "$staging"
+  tar -xzf "${TMP}/${tarball}" -C "$staging"
+  if ! "${staging}/${tarball%.tar.gz}/bin/node" -v >/dev/null 2>&1; then
+    rm -rf "$staging"
+    _die "The official Node.js build doesn't run on this system (musl/Alpine, or a glibc older than 2.28?). Install Node ${NODE_MIN_MAJOR}+ with your package manager and re-run."
+  fi
+  rm -rf "$NODE_DIR"
+  mv "${staging}/${tarball%.tar.gz}" "$NODE_DIR"
+  rm -rf "$staging"
+  NODE_CMD="${NODE_DIR}/bin/node"
+}
+
+if command -v node >/dev/null 2>&1 && _node_usable node; then
+  : # System node is fine: MCP clients keep running plain `node`.
+else
+  if command -v node >/dev/null 2>&1; then
+    _note "Found Node.js $(node -v 2>/dev/null || echo '(unknown version)'), but Chromanche needs ${NODE_MIN_MAJOR}+."
+  else
+    _note "Node.js not found."
+    if [ "$IS_WSL" = "1" ] && command -v node.exe >/dev/null 2>&1; then
+      _note "(Node.js on Windows doesn't count: the MCP server runs inside WSL.)"
+    fi
+  fi
+  _install_private_node
+  PRIVATE_NODE=1
+  # Helpers below (legacy cleanup, zip extraction) run plain `node`.
+  export PATH="${NODE_DIR}/bin:${PATH}"
+fi
+
+# Extract a zip with unzip when available, else with Node: fresh WSL and
+# minimal distros often lack unzip, and installing it would need sudo. Our
+# zips come from CI's `zip -r`: stored/deflated entries, no zip64.
+ZIP_EXTRACT_JS='
+const fs = require("fs"), path = require("path"), zlib = require("zlib");
+const [zipFile, dest] = process.argv.slice(1);
+const buf = fs.readFileSync(zipFile);
+let eocd = -1;
+for (let i = buf.length - 22; i >= Math.max(0, buf.length - 65557); i--) {
+  if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+}
+if (eocd < 0) throw new Error(zipFile + " is not a zip file");
+const root = path.resolve(dest);
+let p = buf.readUInt32LE(eocd + 16);
+for (let n = buf.readUInt16LE(eocd + 10); n > 0; n--) {
+  if (buf.readUInt32LE(p) !== 0x02014b50) throw new Error("corrupt zip central directory");
+  const method = buf.readUInt16LE(p + 10), crc = buf.readUInt32LE(p + 16), size = buf.readUInt32LE(p + 20);
+  const nameLen = buf.readUInt16LE(p + 28);
+  const local = buf.readUInt32LE(p + 42);
+  const name = buf.toString("utf8", p + 46, p + 46 + nameLen);
+  p += 46 + nameLen + buf.readUInt16LE(p + 30) + buf.readUInt16LE(p + 32);
+  const out = path.resolve(root, name);
+  if (out !== root && !out.startsWith(root + path.sep)) throw new Error("unsafe path in zip: " + name);
+  if (name.endsWith("/")) { fs.mkdirSync(out, { recursive: true }); continue; }
+  if (buf.readUInt32LE(local) !== 0x04034b50) throw new Error("corrupt zip entry: " + name);
+  const start = local + 30 + buf.readUInt16LE(local + 26) + buf.readUInt16LE(local + 28);
+  const raw = buf.subarray(start, start + size);
+  const data = method === 0 ? raw : method === 8 ? zlib.inflateRawSync(raw) : null;
+  if (!data) throw new Error("unsupported zip compression method " + method + " for " + name);
+  if (zlib.crc32 && zlib.crc32(data) !== crc) throw new Error("CRC mismatch for " + name);
+  fs.mkdirSync(path.dirname(out), { recursive: true });
+  fs.writeFileSync(out, data);
+}
+'
+_extract_zip() {
+  if command -v unzip >/dev/null 2>&1 && unzip -q "$1" -d "$2" 2>/dev/null; then
+    return 0
+  fi
+  "$NODE_CMD" -e "$ZIP_EXTRACT_JS" "$1" "$2"
+}
+
+# --- Download + unpack -------------------------------------------------------
 # CHROMANCHE_INSTALL_OFFLINE lets integration tests drive the registration
 # logic without hitting GitHub. Point it at a directory laid out like a real
-# install (extension/ + mcp-server/dist/index.cjs) and the installer copies
-# from it instead of downloading. Not documented for end users on purpose.
+# install (extension/ or extension.zip, plus mcp-server/dist/index.cjs) and the
+# installer copies from it instead of downloading. Not documented for end
+# users on purpose.
 if [ -n "${CHROMANCHE_INSTALL_OFFLINE:-}" ]; then
   if [ ! -f "${CHROMANCHE_INSTALL_OFFLINE}/mcp-server/dist/index.cjs" ]; then
     _die "CHROMANCHE_INSTALL_OFFLINE=${CHROMANCHE_INSTALL_OFFLINE} is missing mcp-server/dist/index.cjs"
@@ -94,7 +242,9 @@ if [ -n "${CHROMANCHE_INSTALL_OFFLINE:-}" ]; then
   _note "Installing from offline source: ${CHROMANCHE_INSTALL_OFFLINE}"
   rm -rf "$EXT_DIR" "$SERVER_DIR"
   mkdir -p "$EXT_DIR" "$SERVER_DIR"
-  if [ -d "${CHROMANCHE_INSTALL_OFFLINE}/extension" ]; then
+  if [ -f "${CHROMANCHE_INSTALL_OFFLINE}/extension.zip" ]; then
+    _extract_zip "${CHROMANCHE_INSTALL_OFFLINE}/extension.zip" "$EXT_DIR"
+  elif [ -d "${CHROMANCHE_INSTALL_OFFLINE}/extension" ]; then
     cp -R "${CHROMANCHE_INSTALL_OFFLINE}/extension/." "$EXT_DIR/"
   fi
   cp -R "${CHROMANCHE_INSTALL_OFFLINE}/mcp-server/." "$SERVER_DIR/"
@@ -122,7 +272,7 @@ elif [ "$CHANNEL" = "dev" ]; then
   _note "Unpacking extension to ${EXT_DIR}"
   rm -rf "$EXT_DIR"
   mkdir -p "$EXT_DIR"
-  unzip -q "${TMP}/extension.zip" -d "$EXT_DIR"
+  _extract_zip "${TMP}/extension.zip" "$EXT_DIR"
 
   _note "Unpacking MCP server to ${SERVER_DIR}"
   rm -rf "$SERVER_DIR"
@@ -179,7 +329,7 @@ else
   _note "Unpacking extension to ${EXT_DIR}"
   rm -rf "$EXT_DIR"
   mkdir -p "$EXT_DIR"
-  unzip -q "${TMP}/extension.zip" -d "$EXT_DIR"
+  _extract_zip "${TMP}/extension.zip" "$EXT_DIR"
 
   _note "Unpacking MCP server to ${SERVER_DIR}"
   rm -rf "$SERVER_DIR"
@@ -226,7 +376,7 @@ if command -v claude >/dev/null 2>&1; then
     _note "Existing '${MCP_NAME}' MCP entry found — removing and re-adding."
     claude mcp remove "${MCP_NAME}" --scope user >/dev/null 2>&1 || true
   fi
-  claude mcp add "${MCP_NAME}" --scope user -- node "$ENTRY"
+  claude mcp add "${MCP_NAME}" --scope user -- "$NODE_CMD" "$ENTRY"
   CLAUDE_STATUS="registered"
 else
   _warn "'claude' CLI not found on PATH. Add this manually to ~/.claude/settings.json:"
@@ -235,7 +385,7 @@ else
 {
   "mcpServers": {
     "${MCP_NAME}": {
-      "command": "node",
+      "command": "${NODE_CMD}",
       "args": ["${ENTRY}"]
     }
   }
@@ -260,11 +410,11 @@ if command -v opencode >/dev/null 2>&1; then
     mkdir -p "$(dirname "$OC_CFG")"
     if [ -f "$OC_CFG" ]; then
       TMP_CFG="$(mktemp)"
-      jq --arg n "node" --arg e "$ENTRY" --arg k "$MCP_NAME" \
+      jq --arg n "$NODE_CMD" --arg e "$ENTRY" --arg k "$MCP_NAME" \
         '.mcp[$k] = {"type":"local","command":[$n,$e],"enabled":true}' \
         "$OC_CFG" > "$TMP_CFG" && mv "$TMP_CFG" "$OC_CFG"
     else
-      jq -n --arg n "node" --arg e "$ENTRY" --arg k "$MCP_NAME" \
+      jq -n --arg n "$NODE_CMD" --arg e "$ENTRY" --arg k "$MCP_NAME" \
         '{"$schema":"https://opencode.ai/config.json","mcp":{($k):{"type":"local","command":[$n,$e],"enabled":true}}}' \
         > "$OC_CFG"
     fi
@@ -289,7 +439,7 @@ if command -v opencode >/dev/null 2>&1; then
   "mcp": {
     "${MCP_NAME}": {
       "type": "local",
-      "command": ["node", "${ENTRY}"],
+      "command": ["${NODE_CMD}", "${ENTRY}"],
       "enabled": true
     }
   }
@@ -308,14 +458,14 @@ if command -v codex >/dev/null 2>&1; then
     _note "Existing '${MCP_NAME}' Codex MCP entry found — removing and re-adding."
     codex mcp remove "${MCP_NAME}" >/dev/null 2>&1 || true
   fi
-  codex mcp add "${MCP_NAME}" -- node "$ENTRY"
+  codex mcp add "${MCP_NAME}" -- "$NODE_CMD" "$ENTRY"
   CODEX_STATUS="registered"
 else
   _warn "'codex' CLI not found on PATH. Add this manually to ~/.codex/config.toml:"
   cat <<EOF
 
 [mcp_servers.${MCP_NAME}]
-command = "node"
+command = "${NODE_CMD}"
 args = ["${ENTRY}"]
 
 EOF
@@ -336,13 +486,13 @@ if command -v copilot >/dev/null 2>&1; then
     # delete it so the config validates cleanly.
     if [ -f "$GH_CFG" ]; then
       TMP_CFG="$(mktemp)"
-      jq --arg n "node" --arg e "$ENTRY" --arg k "$MCP_NAME" '
+      jq --arg n "$NODE_CMD" --arg e "$ENTRY" --arg k "$MCP_NAME" '
         (if (.servers // {}) | has($k) then del(.servers[$k]) else . end) |
         (if (.servers // {}) == {} then del(.servers) else . end) |
         .mcpServers[$k] = {"type":"stdio","command":$n,"args":[$e]}
       ' "$GH_CFG" > "$TMP_CFG" && mv "$TMP_CFG" "$GH_CFG"
     else
-      jq -n --arg n "node" --arg e "$ENTRY" --arg k "$MCP_NAME" \
+      jq -n --arg n "$NODE_CMD" --arg e "$ENTRY" --arg k "$MCP_NAME" \
         '{"mcpServers":{($k):{"type":"stdio","command":$n,"args":[$e]}}}' \
         > "$GH_CFG"
     fi
@@ -355,7 +505,7 @@ if command -v copilot >/dev/null 2>&1; then
   "mcpServers": {
     "${MCP_NAME}": {
       "type": "stdio",
-      "command": "node",
+      "command": "${NODE_CMD}",
       "args": ["${ENTRY}"]
     }
   }
@@ -371,6 +521,10 @@ WIN_COPY_LINE=""
 if [ -n "${WIN_EXT_DIR:-}" ]; then
   WIN_COPY_LINE=$'\n'"  Windows copy: ${LOAD_DIR}"
 fi
+NODE_LINE=""
+if [ "$PRIVATE_NODE" = "1" ]; then
+  NODE_LINE=$'\n'"  Node.js:     ${NODE_CMD} ($("$NODE_CMD" -v 2>/dev/null || true), private to Chromanche, not on your PATH)"
+fi
 cat <<EOF
 
 ------------------------------------------------------------------
@@ -378,7 +532,7 @@ cat <<EOF
 ------------------------------------------------------------------
 
   Extension:   ${EXT_DIR}${WIN_COPY_LINE}
-  MCP server:  ${ENTRY}
+  MCP server:  ${ENTRY}${NODE_LINE}
 
   Next steps:
 

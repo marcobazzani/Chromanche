@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -7,6 +7,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -66,19 +67,29 @@ const fakeWindows = () => {
   mkdirSync(winHome(), { recursive: true });
 };
 
-const run = () =>
-  execFileSync("bash", [SCRIPT], {
-    env: {
-      ...process.env,
-      HOME: home,
-      XDG_CONFIG_HOME: join(home, ".config"),
-      PATH: `${bin}:${process.env.PATH ?? ""}`,
-      // Never inherit WSL markers from a developer's WSL shell.
-      WSL_DISTRO_NAME: "",
-      WSL_INTEROP: "",
-    },
-    encoding: "utf8",
-  });
+const envFor = (extra: Record<string, string>) => ({
+  ...process.env,
+  HOME: home,
+  XDG_CONFIG_HOME: join(home, ".config"),
+  PATH: `${bin}:${process.env.PATH ?? ""}`,
+  // Never inherit WSL markers from a developer's WSL shell.
+  WSL_DISTRO_NAME: "",
+  WSL_INTEROP: "",
+  ...extra,
+});
+
+const run = (extra: Record<string, string> = {}) =>
+  execFileSync("bash", [SCRIPT], { env: envFor(extra), encoding: "utf8" });
+
+const runCapture = (extra: Record<string, string> = {}) => {
+  const r = spawnSync("bash", [SCRIPT], { env: envFor(extra), encoding: "utf8" });
+  if (r.status !== 0) throw new Error(`uninstall.sh exited ${r.status}\n${r.stdout}\n${r.stderr}`);
+  return { stdout: r.stdout, stderr: r.stderr };
+};
+
+// PATH without the host's node (only meaningful when no node lives in /usr/bin or /bin).
+const SYSTEM_NODE_IN_BASE_PATH = existsSync("/usr/bin/node") || existsSync("/bin/node");
+const noNodePath = () => ({ PATH: `${bin}:/usr/bin:/bin` });
 
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "chromanche-uninstall-home-"));
@@ -203,5 +214,34 @@ describe("uninstall.sh", () => {
     run();
 
     expect(existsSync(join(winHome(), ".chromanche"))).toBe(false);
+  });
+
+  it.skipIf(SYSTEM_NODE_IN_BASE_PATH)(
+    "without a system node, cleans MCP configs with Chromanche's private Node, then removes it",
+    () => {
+      // What install.sh leaves behind on a machine without Node.
+      mkdirSync(join(home, ".chromanche", "node", "bin"), { recursive: true });
+      symlinkSync(process.execPath, join(home, ".chromanche", "node", "bin", "node"));
+      writeJson(".claude", "settings.json", {
+        mcpServers: { chromanche: { command: join(home, ".chromanche", "node", "bin", "node") }, keepme: { command: "x" } },
+      });
+
+      runCapture(noNodePath());
+
+      expect(readJson(claudeCfg()).mcpServers).toEqual({ keepme: { command: "x" } });
+      expect(existsSync(join(home, ".chromanche"))).toBe(false);
+    },
+  );
+
+  it.skipIf(SYSTEM_NODE_IN_BASE_PATH)("with no Node at all, says configs were left alone and still finishes", () => {
+    mkdirSync(join(home, ".chromanche", "mcp-server"), { recursive: true });
+    writeJson(".claude", "settings.json", { mcpServers: { chromanche: { command: "node" } } });
+
+    const { stderr } = runCapture(noNodePath());
+
+    expect(stderr).toContain("Node.js not found: MCP client config files were left as they are");
+    expect(readJson(claudeCfg()).mcpServers).toHaveProperty("chromanche");
+    expect(existsSync(join(home, ".chromanche"))).toBe(false);
+    expect(readFileSync(commandLog, "utf8")).toContain("claude mcp remove chromanche --scope user");
   });
 });

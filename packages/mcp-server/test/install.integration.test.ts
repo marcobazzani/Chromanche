@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -13,6 +14,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import * as zlib from "node:zlib";
 
 /**
  * Drives scripts/install.sh against a throwaway $HOME with the download path
@@ -33,37 +35,149 @@ let bin: string;
 let offline: string;
 let commandLog: string;
 let winRoot: string;
+let scratch: string;
 
 const opencodeCfg = () => join(home, ".config", "opencode", "opencode.json");
 const opencodeLegacyCfg = () => join(home, ".opencode", "config.json");
 const copilotCfg = () => join(home, ".copilot", "mcp-config.json");
 const readJson = (p: string) => JSON.parse(readFileSync(p, "utf8"));
+const privateNode = () => join(home, ".chromanche", "node", "bin", "node");
+// The no-node cases need PATH (bin/ + /usr/bin + /bin) to have no real node.
+const SYSTEM_NODE_IN_BASE_PATH = existsSync("/usr/bin/node") || existsSync("/bin/node");
 
-const writeFakeCommand = (name: string) => {
-  const path = join(bin, name);
-  writeFileSync(path, [
-    "#!/usr/bin/env bash",
-    `printf '%s %s\\n' "${name}" "$*" >> "${commandLog}"`,
-    "exit 0",
-    "",
-  ].join("\n"));
-  chmodSync(path, 0o755);
-};
+const writeFakeCommand = (name: string) =>
+  writeScript(name, [`printf '%s %s\\n' "${name}" "$*" >> "${commandLog}"`, "exit 0"]);
 
+/** Never write through bin/ symlinks: bin/node and bin/jq point at the host's real binaries. */
 const writeScript = (name: string, lines: string[]) => {
   const path = join(bin, name);
+  rmSync(path, { force: true });
   writeFileSync(path, ["#!/usr/bin/env bash", ...lines, ""].join("\n"));
   chmodSync(path, 0o755);
 };
 
-/** `uname -s` → sys, `uname -r` → release. */
-const writeFakeUname = (sys: string, release: string) =>
+/** `uname -s` → sys, `uname -r` → release, `uname -m` → machine. */
+const writeFakeUname = (sys: string, release: string, machine = "x86_64") =>
   writeScript("uname", [
     'case "$1" in',
     `  -r) printf '%s\\n' '${release}' ;;`,
+    `  -m) printf '%s\\n' '${machine}' ;;`,
     `  *) printf '%s\\n' '${sys}' ;;`,
     "esac",
   ]);
+
+/** A system node that is too old for Chromanche (shadows the real one). */
+const writeOldSystemNode = () =>
+  writeScript("node", ['case "$1" in', "  -v|--version) echo v18.20.4 ;;", "  -e) echo 18 ;;", "esac"]);
+
+/** No node on PATH at all (only meaningful when SYSTEM_NODE_IN_BASE_PATH is false). */
+const removeSystemNode = () => rmSync(join(bin, "node"), { force: true });
+
+/**
+ * A directory laid out like https://nodejs.org/dist/latest-v22.x/, served to
+ * the installer over file:// via CHROMANCHE_NODE_DIST_URL. Its "node" is a
+ * script answering the installer's probes (-v and the -e major check).
+ */
+const makeNodeDist = (opts: {
+  version?: string;
+  os?: string;
+  arch?: string;
+  nodeBody?: string[];
+  badChecksum?: boolean;
+} = {}) => {
+  const version = opts.version ?? "22.99.0";
+  const base = `node-v${version}-${opts.os ?? "linux"}-${opts.arch ?? "x64"}`;
+  const dist = mkdtempSync(join(scratch, "node-dist-"));
+  const stage = mkdtempSync(join(scratch, "node-stage-"));
+  mkdirSync(join(stage, base, "bin"), { recursive: true });
+  const nodeBody = opts.nodeBody ?? [
+    'case "$1" in',
+    `  -v|--version) echo v${version} ;;`,
+    `  -e) echo ${version.split(".")[0]} ;;`,
+    "esac",
+  ];
+  writeFileSync(join(stage, base, "bin", "node"), ["#!/usr/bin/env bash", ...nodeBody, ""].join("\n"));
+  chmodSync(join(stage, base, "bin", "node"), 0o755);
+  const tarball = `${base}.tar.gz`;
+  execFileSync("tar", ["-czf", join(dist, tarball), "-C", stage, base], {
+    env: { ...process.env, COPYFILE_DISABLE: "1" }, // no macOS AppleDouble files
+  });
+  const sha = createHash("sha256").update(readFileSync(join(dist, tarball))).digest("hex");
+  const decoyPlatform = base.endsWith("-darwin-arm64") ? "linux-x64" : "darwin-arm64";
+  writeFileSync(join(dist, "SHASUMS256.txt"), [
+    // Decoys: other platforms and the .tar.xz flavour must not be picked.
+    `${"a".repeat(64)}  node-v${version}-${decoyPlatform}.tar.gz`,
+    `${"b".repeat(64)}  ${base}.tar.xz`,
+    `${opts.badChecksum ? "0".repeat(64) : sha}  ${tarball}`,
+    "",
+  ].join("\n"));
+  return { url: `file://${dist}`, dir: dist, tarball };
+};
+
+// --- Minimal zip writer, so tests control every byte (incl. hostile entries). ---
+const CRC_TABLE = Array.from({ length: 256 }, (_, n) => {
+  let c = n;
+  for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+  return c >>> 0;
+});
+const crc32 = (buf: Buffer) => {
+  let c = 0xffffffff;
+  for (const b of buf) c = CRC_TABLE[(c ^ b) & 0xff]! ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+};
+interface ZipEntry { name: string; data?: string; deflate?: boolean; badCrc?: boolean }
+const DOS_DATE = ((2024 - 1980) << 9) | (1 << 5) | 1;
+const buildZip = (entries: ZipEntry[]): Buffer => {
+  const parts: Buffer[] = [];
+  const central: Buffer[] = [];
+  let offset = 0;
+  for (const e of entries) {
+    const name = Buffer.from(e.name, "utf8");
+    const raw = Buffer.from(e.data ?? "", "utf8");
+    const isDir = e.name.endsWith("/");
+    const method = !isDir && e.deflate ? 8 : 0;
+    const body = method === 8 ? zlib.deflateRawSync(raw) : raw;
+    const crc = isDir ? 0 : (crc32(raw) ^ (e.badCrc ? 1 : 0)) >>> 0;
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(method, 8);
+    local.writeUInt16LE(DOS_DATE, 12);
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(body.length, 18);
+    local.writeUInt32LE(raw.length, 22);
+    local.writeUInt16LE(name.length, 26);
+    const cd = Buffer.alloc(46);
+    cd.writeUInt32LE(0x02014b50, 0);
+    cd.writeUInt16LE(20, 4);
+    cd.writeUInt16LE(20, 6);
+    cd.writeUInt16LE(method, 10);
+    cd.writeUInt16LE(DOS_DATE, 14);
+    cd.writeUInt32LE(crc, 16);
+    cd.writeUInt32LE(body.length, 20);
+    cd.writeUInt32LE(raw.length, 24);
+    cd.writeUInt16LE(name.length, 28);
+    cd.writeUInt32LE(isDir ? 0x10 : 0, 38);
+    cd.writeUInt32LE(offset, 42);
+    parts.push(local, name, body);
+    central.push(cd, name);
+    offset += 30 + name.length + body.length;
+  }
+  const cdBuf = Buffer.concat(central);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(entries.length, 8);
+  eocd.writeUInt16LE(entries.length, 10);
+  eocd.writeUInt32LE(cdBuf.length, 12);
+  eocd.writeUInt32LE(offset, 16);
+  return Buffer.concat([...parts, cdBuf, eocd]);
+};
+
+/** Ship the offline "release" extension as a zip instead of a directory. */
+const useOfflineExtensionZip = (entries: ZipEntry[]) => {
+  rmSync(join(offline, "extension"), { recursive: true, force: true });
+  writeFileSync(join(offline, "extension.zip"), buildZip(entries));
+};
 
 /** WSL interop's cmd.exe: logs the call, prints the profile with a CRLF like the real one. */
 const writeFakeCmdExe = (profile: string) =>
@@ -103,15 +217,21 @@ const envFor = (extraEnv: Record<string, string>) => ({
   // Never inherit WSL markers from a developer's WSL shell.
   WSL_DISTRO_NAME: "",
   WSL_INTEROP: "",
+  // Never reach nodejs.org: an unexpected Node download fails loudly.
+  CHROMANCHE_NODE_DIST_URL: `file://${join(scratch, "no-node-dist")}`,
   ...extraEnv,
 });
 
 const run = (extraEnv: Record<string, string> = {}) =>
   execFileSync("bash", [SCRIPT], { env: envFor(extraEnv), encoding: "utf8" });
 
+/** Runs install.sh without throwing; for the failure cases. */
+const runRaw = (extraEnv: Record<string, string> = {}) =>
+  spawnSync("bash", [SCRIPT], { env: envFor(extraEnv), encoding: "utf8" });
+
 /** Like run(), but also captures stderr (where _warn writes). */
 const runCapture = (extraEnv: Record<string, string> = {}) => {
-  const r = spawnSync("bash", [SCRIPT], { env: envFor(extraEnv), encoding: "utf8" });
+  const r = runRaw(extraEnv);
   if (r.status !== 0) throw new Error(`install.sh exited ${r.status}\n${r.stdout}\n${r.stderr}`);
   return { stdout: r.stdout, stderr: r.stderr };
 };
@@ -121,6 +241,7 @@ beforeEach(() => {
   bin = mkdtempSync(join(tmpdir(), "chromanche-install-bin-"));
   offline = mkdtempSync(join(tmpdir(), "chromanche-install-offline-"));
   winRoot = mkdtempSync(join(tmpdir(), "chromanche-install-winroot-"));
+  scratch = mkdtempSync(join(tmpdir(), "chromanche-install-scratch-"));
   commandLog = join(home, "commands.log");
 
   // The installer hard-requires these on PATH. Symlink the host's copies
@@ -145,6 +266,7 @@ afterEach(() => {
   rmSync(bin, { recursive: true, force: true });
   rmSync(offline, { recursive: true, force: true });
   rmSync(winRoot, { recursive: true, force: true });
+  rmSync(scratch, { recursive: true, force: true });
 });
 
 describe("install.sh OpenCode registration", () => {
@@ -332,4 +454,225 @@ describe("install.sh under WSL", () => {
     expect(stdout).not.toContain("Windows copy:");
     expect(stdout).not.toContain("WSL:");
   });
+});
+
+describe("install.sh Node.js provisioning", () => {
+  const entry = () => join(home, ".chromanche", "mcp-server", "dist", "index.cjs");
+  const log = () => (existsSync(commandLog) ? readFileSync(commandLog, "utf8") : "");
+  const linux = (machine = "x86_64") => writeFakeUname("Linux", "6.8.0-generic", machine);
+
+  it("keeps using a system node that is new enough: no download, plain `node` registered", () => {
+    writeFakeCommand("claude");
+
+    const { stdout } = runCapture();
+
+    expect(stdout).not.toContain("Installing Node.js");
+    expect(existsSync(join(home, ".chromanche", "node"))).toBe(false);
+    expect(log()).toContain(`claude mcp add chromanche --scope user -- node ${entry()}`);
+  });
+
+  it("installs a private Node without sudo when the system node is too old, and registers its absolute path", () => {
+    linux();
+    writeOldSystemNode();
+    const dist = makeNodeDist();
+    for (const cli of ["claude", "opencode", "copilot", "sudo"]) writeFakeCommand(cli);
+
+    const { stdout } = runCapture({ CHROMANCHE_NODE_DIST_URL: dist.url });
+
+    expect(stdout).toContain("Found Node.js v18.20.4, but Chromanche needs 20+.");
+    expect(stdout).toContain(`Installing Node.js v22.99.0 for Chromanche into ${join(home, ".chromanche", "node")} (no sudo)`);
+    expect(execFileSync(privateNode(), ["-v"], { encoding: "utf8" }).trim()).toBe("v22.99.0");
+    expect(existsSync(join(home, ".chromanche", ".node-staging"))).toBe(false);
+    // Every MCP client gets the absolute path: the private node is not on PATH.
+    expect(log()).toContain(`claude mcp add chromanche --scope user -- ${privateNode()} ${entry()}`);
+    expect(readJson(opencodeCfg()).mcp.chromanche.command).toEqual([privateNode(), entry()]);
+    expect(readJson(copilotCfg()).mcpServers.chromanche.command).toBe(privateNode());
+    expect(stdout).toContain(`command = "${privateNode()}"`); // Codex manual instructions
+    expect(stdout).toContain(`Node.js:     ${privateNode()} (v22.99.0, private to Chromanche, not on your PATH)`);
+    expect(log()).not.toMatch(/^sudo /m);
+  });
+
+  it.skipIf(SYSTEM_NODE_IN_BASE_PATH)("installs a private Node when there is no node at all", () => {
+    linux();
+    removeSystemNode();
+    const dist = makeNodeDist();
+
+    const { stdout } = runCapture({ CHROMANCHE_NODE_DIST_URL: dist.url });
+
+    expect(stdout).toContain("Node.js not found.");
+    expect(execFileSync(privateNode(), ["-v"], { encoding: "utf8" }).trim()).toBe("v22.99.0");
+  });
+
+  it.skipIf(SYSTEM_NODE_IN_BASE_PATH)("under WSL, says a Windows node.exe doesn't count", () => {
+    writeFakeUname("Linux", "5.15.167.4-microsoft-standard-WSL2");
+    removeSystemNode();
+    writeScript("node.exe", ["exit 0"]);
+    const dist = makeNodeDist();
+
+    const { stdout } = runCapture({ CHROMANCHE_NODE_DIST_URL: dist.url });
+
+    expect(stdout).toContain("Node.js on Windows doesn't count: the MCP server runs inside WSL.");
+    expect(existsSync(privateNode())).toBe(true);
+  });
+
+  it("picks the build for this CPU (arm64), never a decoy for another platform", () => {
+    linux("aarch64");
+    writeOldSystemNode();
+    const dist = makeNodeDist({ arch: "arm64" });
+
+    runCapture({ CHROMANCHE_NODE_DIST_URL: dist.url });
+
+    expect(execFileSync(privateNode(), ["-v"], { encoding: "utf8" }).trim()).toBe("v22.99.0");
+  });
+
+  it("reuses an up-to-date private Node on re-install without downloading it again", () => {
+    linux();
+    writeOldSystemNode();
+    const dist = makeNodeDist();
+    runCapture({ CHROMANCHE_NODE_DIST_URL: dist.url });
+    rmSync(join(dist.dir, dist.tarball)); // a second download would now fail
+
+    const { stdout } = runCapture({ CHROMANCHE_NODE_DIST_URL: dist.url });
+
+    expect(stdout).toContain(`Using Chromanche's Node.js v22.99.0 (${join(home, ".chromanche", "node")})`);
+    expect(stdout).not.toContain("Installing Node.js");
+  });
+
+  it("upgrades the private Node when a newer build is published", () => {
+    linux();
+    writeOldSystemNode();
+    runCapture({ CHROMANCHE_NODE_DIST_URL: makeNodeDist().url });
+
+    runCapture({ CHROMANCHE_NODE_DIST_URL: makeNodeDist({ version: "22.100.1" }).url });
+
+    expect(execFileSync(privateNode(), ["-v"], { encoding: "utf8" }).trim()).toBe("v22.100.1");
+  });
+
+  it("keeps the existing private Node when the download site is unreachable", () => {
+    linux();
+    writeOldSystemNode();
+    writeFakeCommand("claude");
+    runCapture({ CHROMANCHE_NODE_DIST_URL: makeNodeDist().url });
+
+    const { stderr } = runCapture(); // default env: dist URL that doesn't exist
+
+    expect(stderr).toContain("to check for Node.js updates; keeping v22.99.0.");
+    expect(log()).toContain(`claude mcp add chromanche --scope user -- ${privateNode()} ${entry()}`);
+  });
+
+  it("refuses a Node download whose checksum doesn't match, and registers nothing", () => {
+    linux();
+    writeOldSystemNode();
+    writeFakeCommand("claude");
+    const dist = makeNodeDist({ badChecksum: true });
+
+    const r = runRaw({ CHROMANCHE_NODE_DIST_URL: dist.url });
+
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain(`Checksum mismatch for ${dist.tarball}`);
+    expect(existsSync(join(home, ".chromanche", "node"))).toBe(false);
+    expect(log()).not.toContain("mcp add");
+  });
+
+  it("refuses a Node build that can't run here (musl/old glibc) and leaves nothing half-installed", () => {
+    linux();
+    writeOldSystemNode();
+    const dist = makeNodeDist({ nodeBody: ["exit 127"] });
+
+    const r = runRaw({ CHROMANCHE_NODE_DIST_URL: dist.url });
+
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain("doesn't run on this system");
+    expect(existsSync(join(home, ".chromanche", "node"))).toBe(false);
+    expect(existsSync(join(home, ".chromanche", ".node-staging"))).toBe(false);
+  });
+
+  it("fails clearly on a CPU without an official Node.js build", () => {
+    linux("mips64");
+    writeOldSystemNode();
+
+    const r = runRaw();
+
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain("No official Node.js build for 'mips64'");
+  });
+});
+
+describe("install.sh extension zip extraction", () => {
+  const extDir = () => join(home, ".chromanche", "extension");
+  const ENTRIES: ZipEntry[] = [
+    { name: "manifest.json", data: '{"manifest_version":3}\n' },
+    { name: "icons/" },
+    { name: "icons/readme.txt", data: "deflated ".repeat(50), deflate: true },
+  ];
+  const expectExtracted = () => {
+    expect(readFileSync(join(extDir(), "manifest.json"), "utf8")).toBe('{"manifest_version":3}\n');
+    expect(readFileSync(join(extDir(), "icons", "readme.txt"), "utf8")).toBe("deflated ".repeat(50));
+  };
+  const breakUnzip = () => writeScript("unzip", ["exit 9"]);
+
+  it("extracts with unzip when it is available", () => {
+    useOfflineExtensionZip(ENTRIES);
+
+    run();
+
+    expectExtracted();
+  });
+
+  it("falls back to Node when unzip is missing or fails", () => {
+    useOfflineExtensionZip(ENTRIES);
+    breakUnzip();
+
+    run();
+
+    expectExtracted();
+  });
+
+  it.skipIf(SYSTEM_NODE_IN_BASE_PATH)(
+    "fresh distro with neither node nor unzip: installs a private Node and extracts with it",
+    () => {
+      linuxFresh();
+      useOfflineExtensionZip(ENTRIES);
+      breakUnzip();
+      // The private "node" answers -v itself and hands everything else
+      // (the extraction script) to a real Node.
+      const dist = makeNodeDist({
+        nodeBody: ['case "$1" in', "  -v|--version) echo v22.99.0 ;;", `  *) exec "${process.execPath}" "$@" ;;`, "esac"],
+      });
+
+      runCapture({ CHROMANCHE_NODE_DIST_URL: dist.url });
+
+      expect(execFileSync(privateNode(), ["-v"], { encoding: "utf8" }).trim()).toBe("v22.99.0");
+      expectExtracted();
+    },
+  );
+
+  it("Node fallback refuses entries that escape the extension directory", () => {
+    useOfflineExtensionZip([...ENTRIES, { name: "../escaped.txt", data: "pwned" }]);
+    breakUnzip();
+
+    const r = runRaw();
+
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain("unsafe path in zip: ../escaped.txt");
+    expect(existsSync(join(home, ".chromanche", "escaped.txt"))).toBe(false);
+  });
+
+  it.runIf(typeof (zlib as { crc32?: unknown }).crc32 === "function")(
+    "Node fallback rejects a corrupted entry (CRC mismatch)",
+    () => {
+      useOfflineExtensionZip([{ name: "manifest.json", data: "{}\n", deflate: true, badCrc: true }]);
+      breakUnzip();
+
+      const r = runRaw();
+
+      expect(r.status).not.toBe(0);
+      expect(r.stderr).toContain("CRC mismatch for manifest.json");
+    },
+  );
+
+  function linuxFresh() {
+    writeFakeUname("Linux", "6.8.0-generic", "x86_64");
+    removeSystemNode();
+  }
 });

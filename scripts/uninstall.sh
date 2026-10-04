@@ -46,13 +46,24 @@ if command -v codex >/dev/null 2>&1; then
   done
 fi
 
+# install.sh installs a private Node into ~/.chromanche/node when the system
+# has none; use it for the config cleanup before that directory goes away.
+NODE_CMD="node"
+if ! command -v node >/dev/null 2>&1 && [ -x "${INSTALL_DIR}/node/bin/node" ]; then
+  NODE_CMD="${INSTALL_DIR}/node/bin/node"
+fi
+if [ -n "$MCP_CONFIG_TOOL" ] && ! command -v "$NODE_CMD" >/dev/null 2>&1; then
+  echo "!! Node.js not found: MCP client config files were left as they are (CLI removals above still ran)." >&2
+  MCP_CONFIG_TOOL=""
+fi
+
 if [ -n "$MCP_CONFIG_TOOL" ]; then
   for name in "${NAMES[@]}"; do
-    node "$MCP_CONFIG_TOOL" remove "$CLAUDE_CFG" "$name" || true
-    node "$MCP_CONFIG_TOOL" remove "$OPENCODE_CFG" "$name" || true
-    node "$MCP_CONFIG_TOOL" remove "$OPENCODE_LEGACY_CFG" "$name" || true
-    node "$MCP_CONFIG_TOOL" remove "$COPILOT_CFG" "$name" || true
-    node "$MCP_CONFIG_TOOL" remove-codex "$CODEX_CFG" "$name" || true
+    "$NODE_CMD" "$MCP_CONFIG_TOOL" remove "$CLAUDE_CFG" "$name" || true
+    "$NODE_CMD" "$MCP_CONFIG_TOOL" remove "$OPENCODE_CFG" "$name" || true
+    "$NODE_CMD" "$MCP_CONFIG_TOOL" remove "$OPENCODE_LEGACY_CFG" "$name" || true
+    "$NODE_CMD" "$MCP_CONFIG_TOOL" remove "$COPILOT_CFG" "$name" || true
+    "$NODE_CMD" "$MCP_CONFIG_TOOL" remove-codex "$CODEX_CFG" "$name" || true
   done
 fi
 
