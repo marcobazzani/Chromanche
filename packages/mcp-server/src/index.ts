@@ -15,7 +15,7 @@ import { WebSocketServerTransport } from "./ws-transport.js";
 function buildMcpServer(bridge: BridgeServer, cfg: Config): Server {
   const tools = buildTools(bridge, { notConnectedHelp: cfg.pairingHelp });
   const server = new Server(
-    { name: "chromanche", version: "0.12.1" },
+    { name: "chromanche", version: "0.13.0" },
     { capabilities: { tools: {} } }
   );
 

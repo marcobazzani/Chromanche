@@ -3,7 +3,7 @@
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtK7fwIZ614PQU3kk84m+qPf5UHzWc9uQ6GgCG4N5g32WP0XMf3PSLBK9RUULKKemqdiu3HS7ww9uxBqpfbYjGigNBQg7VagKdwcOmyJfilSVWw6Mw89o7GhXtHsR/NGETxSUuFJUK7Ly6SZSeVan7BYV+kKrpp4642ZrQSYUy9RLH8swB71UOo6JMgfnHHH/KBFNW3a0U0zK2E49gDNra9wgKw/mq554QkRIi49h8i5ANjFVA6U63OR4GdlixTGvcPi2d0+PSWW+krlT0rKam0F5HrM4UB8GbXb6Xx1JIDDp/oRcCuXYV5JcF8qkIn5aJIuG0rdqMPi9TNKEyRD/wQIDAQAB",
   "name": "Chromanche",
   "short_name": "Chromanche",
-  "version": "0.12.1",
+  "version": "0.13.0",
   "description": "Lets a local MCP server drive your logged-in Chrome from an MCP-capable client. Loopback-only. No telemetry.",
   "author": "Marco Bazzani",
   "homepage_url": "https://github.com/marcobazzani/Chromanche",
