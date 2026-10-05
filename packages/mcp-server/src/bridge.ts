@@ -278,6 +278,13 @@ export class BridgeServer {
     if (!this.wss) return;
     const wss = this.wss;
     this.wss = undefined;
+    // wss.close() only resolves once every client socket is gone. Follower MCP
+    // proxies (other client sessions) keep theirs open and reconnect on their
+    // own, so without terminating them a shutting-down leader hangs forever —
+    // still holding those followers on a hub that has no extension.
+    for (const client of wss.clients) {
+      try { client.terminate(); } catch { /* ignore */ }
+    }
     await new Promise<void>((r) => wss.close(() => r()));
   }
 }

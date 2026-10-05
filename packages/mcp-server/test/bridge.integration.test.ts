@@ -210,4 +210,23 @@ describe("BridgeServer integration", () => {
     expect(result).toEqual([]);
     ws.close();
   });
+
+  // Regression: a leader shutting down while follower MCP proxies were
+  // connected never finished close() — wss.close() waits for every client —
+  // so the process lingered as a hub without an extension, keeping the
+  // followers attached to it instead of letting them reconnect elsewhere.
+  it("close() completes and drops follower proxy sockets even while they stay open", async () => {
+    server.setProxyHandler(() => { /* follower keeps its socket open */ });
+    const follower = new WebSocket(`ws://127.0.0.1:${port}`);
+    await new Promise<void>((r) => follower.once("open", () => r()));
+    follower.send(JSON.stringify({ type: "mcp-proxy-hello", token: "secret-token" }));
+    const followerClosed = new Promise<void>((r) => follower.once("close", () => r()));
+    await new Promise((r) => setTimeout(r, 50));
+
+    const closed = server.close().then(() => "closed" as const);
+    const winner = await Promise.race([closed, new Promise((r) => setTimeout(() => r("hung"), 2_000))]);
+    expect(winner).toBe("closed");
+    await followerClosed;
+    expect(follower.readyState).toBe(WebSocket.CLOSED);
+  });
 });
