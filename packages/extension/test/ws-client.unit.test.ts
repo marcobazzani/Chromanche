@@ -80,4 +80,67 @@ describe("WsClient reconnect timer hygiene", () => {
     // After start(), one new socket opens — but no duplicate should fire.
     expect(sockets.length).toBe(2);
   });
+
+  // Regression: the service worker calls start() at module load AND from
+  // runtime.onInstalled/onStartup while the first connect() is still awaiting
+  // getToken(). Two parallel connect loops then kept closing each other's live
+  // socket, failing in-flight tool calls with "extension disconnected".
+  it("start() while a connect is in flight does not spawn a second connection loop", async () => {
+    let releaseToken!: (t: string) => void;
+    const tokenGate = new Promise<string>((r) => { releaseToken = r; });
+    const client = new WsClient(
+      { url: "ws://127.0.0.1:0", getToken: () => tokenGate, onStatus: () => {} },
+      new Dispatcher()
+    );
+    client.start();
+    client.start(); // e.g. onInstalled firing during the first connect
+    releaseToken("tokentoken");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sockets.length).toBe(1);
+    const ws = sockets[0]!;
+    ws.readyState = 1;
+    ws.dispatch("open", {});
+    // A further start() with a live socket is a no-op.
+    client.start();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(sockets.length).toBe(1);
+    expect(ws.readyState).toBe(1); // never closed behind our back
+  });
+
+  it("a dropped connection is re-established by exactly one reconnect loop", async () => {
+    const client = new WsClient(
+      { url: "ws://127.0.0.1:0", getToken: async () => "tokentoken", onStatus: () => {} },
+      new Dispatcher()
+    );
+    client.start();
+    await vi.advanceTimersByTimeAsync(0);
+    sockets[0]!.dispatch("close", { code: 1006 });
+    client.start(); // racing start during the backoff → immediate reconnect, timer cleared
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sockets.length).toBe(2);
+    sockets[1]!.readyState = 1;
+    sockets[1]!.dispatch("open", {});
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(sockets.length).toBe(2);
+  });
+
+  it("stop() then start() (pairing change) replaces the socket without a stray reconnect", async () => {
+    const client = new WsClient(
+      { url: "ws://127.0.0.1:0", getToken: async () => "tokentoken", onStatus: () => {} },
+      new Dispatcher()
+    );
+    client.start();
+    await vi.advanceTimersByTimeAsync(0);
+    sockets[0]!.readyState = 1;
+    sockets[0]!.dispatch("open", {});
+    client.stop();
+    client.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sockets.length).toBe(2);
+    sockets[1]!.readyState = 1;
+    sockets[1]!.dispatch("open", {});
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(sockets.length).toBe(2);
+    expect(sockets[1]!.readyState).toBe(1);
+  });
 });
