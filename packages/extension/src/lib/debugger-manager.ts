@@ -1,3 +1,5 @@
+import { forgetScreenshot } from "./screenshot-transform.js";
+
 export interface ConsoleEntry {
   ts: number;
   level: "log" | "info" | "warn" | "error" | "debug";
@@ -183,6 +185,7 @@ export class DebuggerManager {
     this.networks.delete(tabId);
     this.pendingDialogs.delete(tabId);
     this.requestDetails.delete(tabId);
+    forgetScreenshot(tabId);
   }
 
   /**
@@ -300,12 +303,19 @@ export class DebuggerManager {
     if (targetId) {
       // Frame-scoped call. No reconnect-on-detach here: if an OOPIF dies
       // mid-call, the caller needs a fresh snapshot to learn its new uids
-      // anyway, so just surface the error.
+      // anyway, so just surface the error. Only forget the frame when the
+      // error says the target itself is gone — an ordinary failure (bad
+      // expression, node not found, context reset) must not drop a live
+      // frame: Target.attachedToTarget never fires again for it, so it would
+      // stay invisible until the whole tab re-attached.
       try {
         return (await chrome.debugger.sendCommand({ targetId }, method, params as object)) as T;
       } catch (e) {
-        const set = this.frameTargets.get(tabId);
-        set?.delete(targetId);
+        const msg = e instanceof Error ? e.message : String(e);
+        if (/not attached|detached|no target with given id|target closed|cannot find (the )?target/i.test(msg)) {
+          this.frameTargets.get(tabId)?.delete(targetId);
+          this.frameTargetToTab.delete(targetId);
+        }
         throw e;
       }
     }

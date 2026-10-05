@@ -215,7 +215,7 @@ export function buildTools(bridge: BridgeServer, opts: BuildToolsOptions = {}) {
 
   const page_snapshot: Tool<z.infer<ReturnType<typeof withProfile<typeof PageSnapshotParamsSchema>>>> = {
     description:
-      "Take a snapshot of the page. Default mode=a11y returns a uid-annotated accessibility tree — each interactive element has a [uid] you can pass to click/type/hover. Set includeBounds=true in a11y mode to add bbox=x,y,w,h for visible accessible nodes, useful for generic grid/canvas positioning when row/column-like cells are exposed. mode=text returns innerText. mode=dom returns outerHTML. Set since=\"last\" (a11y mode) to return ONLY the lines that changed since this tab's previous snapshot (prefixed +/-) — a big token/speed saver on heavy pages; falls back to a full snapshot with baseline=true when there's no prior snapshot. ALWAYS take a snapshot before interacting with a page. If tabId is omitted, reads the active tab.",
+      "Take a snapshot of the page. Default mode=a11y returns a uid-annotated accessibility tree — each interactive element has a [uid] you can pass to click/type/hover. uids are stable: the same element keeps its uid across snapshots. Set includeBounds=true in a11y mode to add bbox=x,y,w,h (CSS pixels — pass space:\"css\" when feeding them to page_click_xy). mode=text returns innerText. mode=dom returns outerHTML. Set since=\"last\" (a11y mode) to return ONLY the lines that changed since this tab's previous snapshot (prefixed +/-) — a big token/speed saver on heavy pages; uids of unchanged elements stay valid; falls back to a full snapshot with baseline=true when there's no prior snapshot. ALWAYS take a snapshot before interacting with a page. If tabId is omitted, reads the active tab.",
     inputSchema: withProfile(PageSnapshotParamsSchema),
     handler: async (params) => {
       guard(bridge);
@@ -228,14 +228,17 @@ export function buildTools(bridge: BridgeServer, opts: BuildToolsOptions = {}) {
 
   const page_screenshot: Tool<z.infer<ReturnType<typeof withProfile<typeof PageScreenshotParamsSchema>>>> = {
     description:
-      "Capture a screenshot of the visible area of a tab. Returns the rendered image as MCP image content plus viewport metadata — multimodal models see the pixels directly and can identify on-screen positions for page_click_xy. Prefer page_snapshot for understanding DOM structure; use page_screenshot when you need to read or click something visually (charts, virtual canvases, custom-rendered widgets). For grid/canvas editors, inspect the screenshot before writing so you can avoid overwriting visible existing content.",
+      "Capture a screenshot of THIS tab's visible area (works for the tab you name, not whatever tab the user is looking at). Returns MCP image content plus metadata. The image is downscaled to fit vision-model limits (maxEdge 1568px / ~1.15 MP by default) so you see it unresized — positions you read off the image can be passed STRAIGHT to page_click_xy (it converts them with this screenshot's scale/origin). Use clip={x,y,width,height} (CSS px) to zoom into a region at higher detail (e.g. to read small cell text). Prefer page_snapshot for DOM structure; use screenshots for canvases/custom widgets. If the tab is in the background and can't render, you get an error suggesting tabs_activate (which brings it to the front — the user's typing would then go there). For grid/canvas editors, inspect the screenshot before writing so you don't overwrite visible content.",
     inputSchema: withProfile(PageScreenshotParamsSchema),
     handler: async (params) => {
       guard(bridge);
       const { profile, params: p } = splitProfile(params as Record<string, unknown>);
       const parsed = PageScreenshotParamsSchema.parse(p);
       if (parsed.tabId !== undefined) await ensureClaim(parsed.tabId, profile);
-      const r = await bridge.call("page.screenshot", parsed, profile) as { format: string; base64: string; viewport?: unknown };
+      const r = await bridge.call("page.screenshot", parsed, profile) as {
+        format: string; base64: string; viewport?: unknown;
+        image?: { width: number; height: number }; scale?: number; origin?: { x: number; y: number }; capture?: string;
+      };
       const mimeType = r.format === "png" ? "image/png" : "image/jpeg";
       return {
         content: [
@@ -243,7 +246,19 @@ export function buildTools(bridge: BridgeServer, opts: BuildToolsOptions = {}) {
           // Companion text item: lets agents that ignore image content (e.g.
           // when relayed through page_batch) still see the metadata. Excludes
           // base64 — clients that need the bytes call page_screenshot directly.
-          { type: "text" as const, text: JSON.stringify({ format: r.format, byteLength: r.base64.length, viewport: r.viewport }) },
+          {
+            type: "text" as const,
+            text: JSON.stringify({
+              format: r.format,
+              byteLength: r.base64.length,
+              viewport: r.viewport,
+              image: r.image,
+              scale: r.scale,
+              origin: r.origin,
+              capture: r.capture,
+              ...(r.image ? { coordinates: "page_click_xy takes pixel positions of THIS image directly (space defaults to \"screenshot\")." } : {}),
+            }),
+          },
         ],
       };
     },
@@ -294,12 +309,9 @@ export function buildTools(bridge: BridgeServer, opts: BuildToolsOptions = {}) {
 
   const page_click_xy: Tool<z.infer<ReturnType<typeof withProfile<typeof PageClickXyParamsSchema>>>> = {
     description:
-      "Click at absolute viewport coordinates (x, y). Supports clickCount=2 for double-click. Vision-driven escape hatch for virtual-canvas widgets where uid bbox centers don't map to specific cells (Excel grid cells, Google Sheets, Figma, custom-rendered surfaces). " +
-      "Workflow: " +
-      "1) call page_screenshot — the response includes the rendered image, which the model can see directly. " +
-      "2) identify the target's pixel coordinates from the image (e.g., Excel cell A2 ≈ (45, 107)). " +
-      "3) call page_click_xy with those coordinates. " +
-      "Coordinates are in viewport pixels matching the screenshot. Prefer page_click(uid) for real DOM elements — it survives layout shifts and is robust. Use page_click_xy only when no uid corresponds to the target you can see.",
+      "Click at a point (x, y). Supports clickCount=2 for double-click. Vision-driven escape hatch for canvas-like widgets where no uid maps to the target (custom-rendered surfaces, canvas grids, drawing tools). " +
+      "Workflow: 1) page_screenshot, 2) read the target's pixel position off THAT image, 3) page_click_xy with those numbers — space defaults to \"screenshot\" and they are converted with the screenshot's scale/origin (the image is downscaled, so never rescale yourself). " +
+      "Pass space:\"css\" for CSS viewport pixels (e.g. page_snapshot bboxes). The pointer hovers first, then clicks. The result reports the CSS point clicked and where keyboard focus settled. Prefer page_click(uid) for real DOM elements.",
     inputSchema: withProfile(PageClickXyParamsSchema),
     handler: async (params) => {
       guard(bridge);
@@ -312,8 +324,12 @@ export function buildTools(bridge: BridgeServer, opts: BuildToolsOptions = {}) {
 
   const page_type: Tool<z.infer<ReturnType<typeof withProfile<typeof PageTypeParamsSchema>>>> = {
     description:
-      "Type text into an input/textarea by uid (from a snapshot) or CSS selector. Clears the field first by default. Set requireEmpty=true to refuse typing when the focused target or active descendant already exposes value/text; use this before writing into grid/canvas cells to avoid accidental overwrites. Set submit=true to submit the enclosing form. Set includeSnapshot=true to get an updated accessibility tree in the response. Embedded \\t becomes a Tab key and \\n becomes an Enter key. " +
-      "If uid AND selector are BOTH omitted, page_type dispatches keystrokes at whatever currently has focus — no element resolution, no focus verification. This is the canonical primitive for typing into a virtual-canvas cell after a page_click_xy: 1) page_screenshot to see the rendered grid, 2) page_click_xy(x, y) to anchor a specific cell, 3) page_type(text=\"value\\tvalue\\t…\") to fill the row, 4) page_press_key(Enter) and repeat. Same pattern works on Excel for the Web, Google Sheets, Figma, Notion — any virtual canvas.",
+      "Type text as real keystrokes into an input/textarea/contenteditable by uid (from a snapshot) or CSS selector. clear=true (default) empties the field first the way a person would (select its contents + Backspace) and verifies it — if it can't be emptied you get an error instead of the new text being merged with the old. Set requireEmpty=true to refuse typing when the focused target (or its active descendant) already has a value or text; content a page exposes only through an accessible name isn't detected — check focus.activeDescendantName. Set submit=true to submit the enclosing form. " +
+      "modifiers apply to the whole run (chords); use \"ControlOrMeta\" for the platform shortcut key (⌘ on macOS, Ctrl on Windows/Linux/ChromeOS). " +
+      "If uid AND selector are both omitted, keystrokes go to whatever has focus (including focused iframes) — use after page_click_xy on canvas-like widgets. " +
+      "The result reports what the page did with the input: `focus` = where focus settled and what it holds once the page applied the keystrokes (rich editors apply them asynchronously — trust `focus`, not an immediate re-read); `focus.popups` = a suggestion list, menu or dialog the typing opened (while a list is open, Enter or Tab usually picks its highlighted item — press Escape first to keep exactly what you typed). " +
+      "exact=true (default): if the page inline-completes your text (the field was empty and now shows your text plus a suggested remainder), Delete is pressed to drop the suggestion and `completion` reports it. " +
+      "Embedded \\t becomes Tab and \\n becomes Enter; widgets differ in where Enter moves next, so in grids anchor each row explicitly rather than chaining rows with \\n.",
     inputSchema: withProfile(PageTypeParamsSchema),
     handler: async (params) => {
       guard(bridge);
@@ -326,7 +342,7 @@ export function buildTools(bridge: BridgeServer, opts: BuildToolsOptions = {}) {
 
   const page_scroll: Tool<z.infer<ReturnType<typeof withProfile<typeof PageScrollParamsSchema>>>> = {
     description:
-      "Scroll a tab by (dx, dy) pixels, to an element matching a CSS selector, or to 'top'/'bottom'. Provide exactly one target in js mode. Set mode='wheel' to dispatch a REAL mouse-wheel event (needs dx/dy, optionally anchored at a uid/selector centre) — use this for virtualized grids like Excel for the Web that lazy-load rows on wheel scroll. Set includeSnapshot=true to get an updated accessibility tree.",
+      "Scroll a tab by (dx, dy) pixels, to an element matching a CSS selector, or to 'top'/'bottom'. Provide exactly one target in js mode. Set mode='wheel' to dispatch a REAL mouse-wheel event (needs dx/dy, optionally anchored at a uid/selector centre) — use this for virtualized grids and lists that lazy-load rows on wheel scroll. Set includeSnapshot=true to get an updated accessibility tree.",
     inputSchema: withProfile(PageScrollParamsSchema),
     handler: async (params) => {
       guard(bridge);
@@ -339,9 +355,10 @@ export function buildTools(bridge: BridgeServer, opts: BuildToolsOptions = {}) {
 
   const page_paste: Tool<z.infer<ReturnType<typeof withProfile<typeof PagePasteParamsSchema>>>> = {
     description:
-      "Paste text into the page (clipboard write + Cmd/Ctrl+V). The reliable primitive for bulk grid fill — Excel for the Web and Google Sheets parse pasted TSV deterministically (Tab → next cell, newline → next row). No keystroke timing races, no per-cell anchors. " +
-      "Modes: target=\"current\" (default) pastes at whatever has document focus; target=\"uid\" resolves the uid (preferred), auto-focuses, then pastes; target=\"xy\" coordinate-clicks at (x, y) first to set focus, then pastes. " +
-      "Caveat: this overwrites the user's clipboard (not restored). Prefer page_paste over multi-step page_type for any grid fill larger than ~10 cells.",
+      "Paste text the way a person does: put it on the clipboard and press the platform paste shortcut (⌘V on macOS, Ctrl+V on Windows/Linux/ChromeOS — the browser's OS decides). Many grid widgets split pasted tab-separated text into cells (Tab → next cell, newline → next row). " +
+      "Success is verified: the call fails unless a real paste event reached the focused element (result: pasteDelivered, pasteHandledByPage). " +
+      "Modes: target=\"current\" (default) pastes at the current focus (including focused iframes); target=\"uid\" focuses the uid first; target=\"xy\" clicks (x, y) first — screenshot pixels by default, space:\"css\" for CSS px. " +
+      "Caveat: this REPLACES the user's clipboard and does not restore it — only use it when the user asked for a paste or agreed to their clipboard being overwritten; otherwise type.",
     inputSchema: withProfile(PagePasteParamsSchema),
     handler: async (params) => {
       guard(bridge);
@@ -356,9 +373,10 @@ export function buildTools(bridge: BridgeServer, opts: BuildToolsOptions = {}) {
     description:
       "Wait for a condition before continuing — the antidote to racing heavy async SPAs (Power Automate's lazy canvas, Office365 chrome). Modes (`for`): " +
       "\"uid\" (preferred) waits for a uid from the last snapshot to reach `state` (visible/hidden/attached/detached); OOPIF-aware. " +
-      "\"selector\" same, but main-frame only (fallback). " +
-      "\"text\" waits for case-insensitive visible page text to appear (state=visible) or disappear (state=hidden) — the most natural wait, e.g. \"Payment complete\"; main-frame only. " +
+      "\"selector\" same, by CSS selector. " +
+      "\"text\" waits for case-insensitive visible page text to appear (state=visible) or disappear (state=hidden), e.g. \"Payment complete\". " +
       "\"function\" waits for a JS `expression` to evaluate truthy. " +
+      "selector/text/function run in the top frame unless `frame` is set: \"focused\" (the frame holding keyboard focus) or a regex over frame URLs (e.g. \"app\\\\.example\\\\.com\"). " +
       "\"response\" waits for a request whose URL matches `urlPattern` to appear in the network buffer AFTER this call is armed (observational — does NOT claim the tab). " +
       "\"loadstate\" waits for load/domcontentloaded/networkidle. Throws on timeout (default 10s).",
     inputSchema: withProfile(PageWaitParamsSchema),
@@ -401,14 +419,14 @@ export function buildTools(bridge: BridgeServer, opts: BuildToolsOptions = {}) {
 
   const page_focus: Tool<z.infer<ReturnType<typeof withProfile<typeof PageFocusParamsSchema>>>> = {
     description:
-      "Make a target element the active element, with verification. Use this when an SPA grabs focus back (Excel for the Web, Google Sheets, Figma) and a previous page_type returned a 'couldn't focus' error reporting that document.activeElement is something else. " +
+      "Make a target element the active element, with verification. Use this when a web app grabs focus back and a previous page_type returned a 'couldn't focus' error reporting that document.activeElement is something else. " +
       "Modes: " +
       "auto (default) — JS focus → verify → escalate to coordinate-click on mismatch. Same dance page_type does internally; useful when you want to verify focus before a typing batch. " +
       "js — JS focus only (gentle, doesn't dismiss popovers, doesn't activate buttons). " +
       "click — coordinate-click only (dispatches a real OS-level click; reaches the app's input router). " +
       "blur+click — drop sticky focus first via document.activeElement.blur(), then coordinate-click. Strongest dislodge. " +
       "Result includes focused (boolean) and, on mismatch, actualTag/actualRole/actualName so the model can diagnose what's stealing focus. " +
-      "Note: virtual-canvas widgets (Excel grid cells, Figma frames) need app-specific selection (Name Box, Cmd+G) — page_focus alone can't move you to a specific cell.",
+      "Note: canvas-like widgets need the app's own navigation (e.g. its go-to box or keyboard navigation) — page_focus alone can't move you to a specific cell.",
     inputSchema: withProfile(PageFocusParamsSchema),
     handler: async (params) => {
       guard(bridge);
@@ -421,7 +439,7 @@ export function buildTools(bridge: BridgeServer, opts: BuildToolsOptions = {}) {
 
   const page_press_key: Tool<z.infer<ReturnType<typeof withProfile<typeof PagePressKeyParamsSchema>>>> = {
     description:
-      "Press a keyboard key (Enter, Escape, Tab, ArrowDown, Backspace, Space, F2, etc.). Supports modifiers: Alt, Control, Meta, Shift. Keystrokes are routed to the focused document, including focused OOPIF frames used by virtualized editors. Set includeSnapshot=true to get the updated page state.",
+      "Press a keyboard key (Enter, Escape, Tab, ArrowDown, Backspace, Space, F2, PageDown, a single character, …) with optional modifiers: Alt, Control, Meta, Shift, or \"ControlOrMeta\" — the platform shortcut key (⌘ on macOS, Ctrl on Windows/Linux/ChromeOS), e.g. key \"z\" + [\"ControlOrMeta\"] is Undo everywhere. Editing shortcuts (select all, copy, cut, paste, undo, redo) work on every OS. Keystrokes are routed to the focused document, including focused OOPIF frames. The result includes `focus`: where focus settled afterwards (set settle:false to skip waiting).",
     inputSchema: withProfile(PagePressKeyParamsSchema),
     handler: async (params) => {
       guard(bridge);
@@ -525,7 +543,7 @@ export function buildTools(bridge: BridgeServer, opts: BuildToolsOptions = {}) {
 
   const page_eval_js: Tool<z.infer<ReturnType<typeof withProfile<typeof PageEvalJsParamsSchema>>>> = {
     description:
-      "Evaluate a JavaScript expression in a tab's context. Use as an escape hatch when other tools don't cover your needs.",
+      "Evaluate a JavaScript expression in a tab's context. Use as an escape hatch when other tools don't cover your needs. `frame` reaches into iframes, including cross-origin ones: \"top\" (default), \"focused\" (the frame holding keyboard focus), or a regex over frame URLs (e.g. \"app\\\\.example\\\\.com\"). The result names the frame it ran in.",
     inputSchema: withProfile(PageEvalJsParamsSchema),
     handler: async (params) => {
       guard(bridge);
@@ -604,14 +622,11 @@ export function buildTools(bridge: BridgeServer, opts: BuildToolsOptions = {}) {
     description:
       "Run several Chromanche tools sequentially in a single MCP round-trip. " +
       "Use this when you have a known sequence of actions (click → type → screenshot, " +
-      "fill several fields, navigate then snapshot, write a whole row in Excel) — it " +
+      "fill several fields, navigate then snapshot) — it " +
       "eliminates the per-step model loop latency. Steps run in order; by default the " +
       "first failure aborts the rest. Set stopOnError=false to run every step and " +
       "collect per-step errors. The batch-level profile (if set) is forwarded to each " +
       "step that doesn't override it. Cannot nest page_batch inside itself. " +
-      "Reliable Excel/Sheets grid pattern (per row): " +
-      "page_click(<column-A cell of this row>) → page_type(<value>) → page_press_key(Tab) → page_type(<next value>) → page_press_key(Tab) → … → page_press_key(Enter), " +
-      "then re-anchor the next row with another page_click. Don't rely on embedded \\t/\\n in page_type to walk a grid — it races focus. " +
       "Note: page_screenshot results inside a batch are auto-truncated above ~30KB of base64; if you need the actual bytes, call page_screenshot outside the batch. " +
       "Caveat: some MCP harnesses misencode long step-args strings containing many literal Tab/newline characters and the steps array arrives at the server as a stringified blob (Zod sees \"expected array, received string\"). For bulk text fill prefer a single direct page_type or page_paste call outside the batch.",
     inputSchema: withProfile(PageBatchParamsSchema),

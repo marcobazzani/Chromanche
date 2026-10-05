@@ -11,6 +11,9 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CHROMANCHE_E2E: "1"
+      # Paste tests write the system clipboard — fine on a throwaway CI
+      # display (xvfb), never by default on a developer's machine.
+      CHROMANCHE_E2E_CLIPBOARD: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4

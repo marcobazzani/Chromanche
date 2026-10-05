@@ -132,6 +132,50 @@ describe("tool adapters", () => {
     expect(parsedMeta.base64).toBeUndefined();
   });
 
+  it("page_screenshot surfaces the image→viewport transform so coordinates can be used verbatim", async () => {
+    const { bridge } = fakeBridge();
+    (bridge.call as any).mockImplementation(async (method: string) => {
+      if (method === "session.claim") return { ok: true, groupId: 7 };
+      return {
+        format: "jpeg", base64: "aGk=", image: { width: 1568, height: 700 },
+        scale: 1.6327, origin: { x: 0, y: 0 }, capture: "cdp",
+      };
+    });
+    const tools = buildTools(bridge);
+    const result = await tools.page_screenshot.handler({ tabId: 5 });
+    const meta = JSON.parse((result.content.find((c: any) => c.type === "text") as any).text);
+    expect(meta.image).toEqual({ width: 1568, height: 700 });
+    expect(meta.scale).toBe(1.6327);
+    expect(meta.capture).toBe("cdp");
+    expect(meta.coordinates).toMatch(/page_click_xy/);
+  });
+
+  it("page_click_xy forwards space (default screenshot) to the extension", async () => {
+    const { bridge, calls } = fakeBridge();
+    const tools = buildTools(bridge);
+    await tools.page_click_xy.handler({ tabId: 5, x: 10, y: 20 });
+    await tools.page_click_xy.handler({ tabId: 5, x: 10, y: 20, space: "css" });
+    const clicks = calls.filter((c) => c.method === "page.clickXy");
+    expect((clicks[0]!.params as any).space).toBe("screenshot");
+    expect((clicks[1]!.params as any).space).toBe("css");
+  });
+
+  it("page_press_key accepts the portable ControlOrMeta modifier", async () => {
+    const { bridge, calls } = fakeBridge();
+    const tools = buildTools(bridge);
+    await tools.page_press_key.handler({ tabId: 5, key: "z", modifiers: ["ControlOrMeta"] });
+    const press = calls.find((c) => c.method === "page.pressKey")!;
+    expect((press.params as any).modifiers).toEqual(["ControlOrMeta"]);
+  });
+
+  it("page_eval_js forwards a frame selector", async () => {
+    const { bridge, calls } = fakeBridge();
+    const tools = buildTools(bridge);
+    await tools.page_eval_js.handler({ tabId: 5, expression: "1", frame: "focused" });
+    const ev = calls.find((c) => c.method === "page.evalJs")!;
+    expect((ev.params as any).frame).toBe("focused");
+  });
+
   it("page_navigate does not re-claim an already-claimed tab", async () => {
     const { bridge, calls } = fakeBridge();
     const tools = buildTools(bridge);

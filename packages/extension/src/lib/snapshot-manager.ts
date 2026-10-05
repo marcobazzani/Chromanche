@@ -22,8 +22,15 @@ export interface UidEntry {
   targetId?: string;
 }
 
-/** Per-tab uid map. Cleared on each new snapshot. */
+/** Per-tab uid map. Rebuilt on each snapshot (only nodes present now resolve). */
 const tabUidMaps = new Map<number, Map<string, UidEntry>>();
+/**
+ * Per-tab stable identity → uid, so the SAME DOM node keeps the SAME uid across
+ * snapshots (identity = frame target + backendNodeId). Without this every
+ * snapshot re-minted uids and since:"last" diffs — which only print changed
+ * lines — left unchanged elements un-addressable.
+ */
+const tabStableUids = new Map<number, Map<string, string>>();
 let uidCounter = 0;
 
 function nextUid(): string {
@@ -38,6 +45,7 @@ export function resolveUid(tabId: number, uid: string): UidEntry | undefined {
 /** Clear uid map for a tab (e.g. on tab close). */
 export function clearUidMap(tabId: number): void {
   tabUidMaps.delete(tabId);
+  tabStableUids.delete(tabId);
   tabPrevLines.delete(tabId);
 }
 
@@ -173,6 +181,8 @@ export async function captureA11ySnapshot(
   }
 
   const uidMap = new Map<string, UidEntry>();
+  const prevStable = tabStableUids.get(tabId);
+  const stable = new Map<string, string>();
   const lines: string[] = [];
   let totalLen = 0;
   let truncated = false;
@@ -216,7 +226,9 @@ export async function captureA11ySnapshot(
 
       let childrenDepth = depth;
       if (isInteresting(node) && node.backendDOMNodeId) {
-        const uid = nextUid();
+        const identity = `${targetId ?? ""}:${node.backendDOMNodeId}`;
+        const uid = prevStable?.get(identity) ?? nextUid();
+        stable.set(identity, uid);
         const name = (node.name?.value ?? "").trim();
         uidMap.set(uid, {
           backendNodeId: node.backendDOMNodeId,
@@ -281,6 +293,7 @@ export async function captureA11ySnapshot(
 
   await walkTree(main.nodes, 0, undefined);
   tabUidMaps.set(tabId, uidMap);
+  tabStableUids.set(tabId, stable);
 
   const prev = tabPrevLines.get(tabId);
   // Always update the baseline to the freshly rendered full tree.
@@ -291,15 +304,14 @@ export async function captureA11ySnapshot(
       // No baseline yet → return the full tree and flag it.
       return { content: lines.join("\n"), truncated, baseline: true };
     }
-    // Diff on the uid-stripped line (role/name/attrs/indent) because uids are
-    // assigned from a monotonic counter and change every snapshot — comparing
-    // raw lines would mark everything changed. We emit the CURRENT full line
-    // (with its fresh uid) for additions so the model can act on it.
-    const stripUid = (l: string) => l.replace(/\[e\d+\]\s*/, "");
-    const prevKeys = new Set(prev.map(stripUid));
-    const curKeys = new Set(lines.map(stripUid));
-    const added = lines.filter((l) => !prevKeys.has(stripUid(l)));
-    const removed = prev.filter((l) => !curKeys.has(stripUid(l)));
+    // uids are stable per DOM node, so lines compare as-is: an unchanged
+    // element keeps its line (and uid) and is omitted; a node that was
+    // re-created shows as -old/+new because its uid changed — which tells the
+    // model the old uid is gone.
+    const prevSet = new Set(prev);
+    const curSet = new Set(lines);
+    const added = lines.filter((l) => !prevSet.has(l));
+    const removed = prev.filter((l) => !curSet.has(l));
     const diffLines = [
       ...added.map((l) => `+ ${l}`),
       ...removed.map((l) => `- ${l}`),

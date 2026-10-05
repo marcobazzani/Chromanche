@@ -2,13 +2,15 @@ import type { Dispatcher } from "../dispatcher.js";
 import type { DebuggerManager } from "../lib/debugger-manager.js";
 import { PageWaitParamsSchema } from "@chromanche/shared";
 import { resolveUid } from "../lib/snapshot-manager.js";
+import { resolveFrame } from "../lib/focus.js";
 import { takeA11ySnapshot } from "./page-read.js";
 
 /**
  * Explicit waiting primitive — the missing piece for heavy async SPAs
  * (Power Automate's lazy canvas, Office365's async chrome). uid mode is
- * preferred and OOPIF-aware; selector/function are main-frame only; response
- * mode is observational (only matches requests that arrive AFTER arming).
+ * preferred and OOPIF-aware; selector/text/function run in the top frame by
+ * default or in the frame picked by `frame`; response mode is observational
+ * (only matches requests that arrive AFTER arming).
  */
 
 interface VisibilityValue {
@@ -75,6 +77,7 @@ async function selectorVisibility(
   mgr: DebuggerManager,
   tabId: number,
   selector: string,
+  targetId?: string,
 ): Promise<VisibilityValue | undefined> {
   const r = await mgr.sendCommand<{ result: { value: VisibilityValue } }>(
     tabId,
@@ -90,15 +93,17 @@ async function selectorVisibility(
       })()`,
       returnByValue: true,
     },
+    targetId,
   );
   return r.result.value;
 }
 
-async function evalTruthy(mgr: DebuggerManager, tabId: number, expression: string): Promise<boolean> {
+async function evalTruthy(mgr: DebuggerManager, tabId: number, expression: string, targetId?: string): Promise<boolean> {
   const r = await mgr.sendCommand<{ result: { value?: unknown } }>(
     tabId,
     "Runtime.evaluate",
     { expression, returnByValue: true },
+    targetId,
   );
   return !!r.result.value;
 }
@@ -112,6 +117,9 @@ export function registerPageWaitHandlers(d: Dispatcher, mgr: DebuggerManager) {
     // replays the user's prior network history (data-residency principle).
     const armedAt = start;
     let lastNetTs = armedAt;
+    // selector / text / function modes may target an iframe (resolved once).
+    const usesFrame = p.for === "selector" || p.for === "text" || p.for === "function";
+    const frameTarget = usesFrame && p.frame ? (await resolveFrame(mgr, p.tabId, p.frame)).targetId : undefined;
 
     for (;;) {
       let satisfied = false;
@@ -122,17 +130,17 @@ export function registerPageWaitHandlers(d: Dispatcher, mgr: DebuggerManager) {
           break;
         }
         case "selector": {
-          const v = await selectorVisibility(mgr, p.tabId, p.selector!);
+          const v = await selectorVisibility(mgr, p.tabId, p.selector!, frameTarget);
           satisfied = stateSatisfied(p.state, v);
           break;
         }
         case "function": {
-          satisfied = await evalTruthy(mgr, p.tabId, p.expression!);
+          satisfied = await evalTruthy(mgr, p.tabId, p.expression!, frameTarget);
           break;
         }
         case "text": {
           // Case-insensitive substring of VISIBLE page text (innerText, not
-          // innerHTML — hidden markup must not false-positive). Main frame only.
+          // innerHTML — hidden markup must not false-positive).
           const r = await mgr.sendCommand<{ result: { value: boolean } }>(
             p.tabId,
             "Runtime.evaluate",
@@ -142,6 +150,7 @@ export function registerPageWaitHandlers(d: Dispatcher, mgr: DebuggerManager) {
               )})`,
               returnByValue: true,
             },
+            frameTarget,
           );
           const present = !!r.result.value;
           satisfied = p.state === "hidden" || p.state === "detached" ? !present : present;

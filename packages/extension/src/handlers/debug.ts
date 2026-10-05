@@ -1,6 +1,7 @@
 import type { Dispatcher } from "../dispatcher.js";
 import type { DebuggerManager } from "../lib/debugger-manager.js";
 import { resolveTabId } from "../lib/active-tab.js";
+import { resolveFrame } from "../lib/focus.js";
 import {
   PageEvalJsParamsSchema,
   ConsoleReadParamsSchema,
@@ -11,7 +12,7 @@ import {
 
 type RuntimeEvaluateResult = {
   result: { type: string; value?: unknown; description?: string };
-  exceptionDetails?: { text: string };
+  exceptionDetails?: { text: string; exception?: { description?: string } };
 };
 
 type FetchBridgeResult = {
@@ -30,19 +31,25 @@ export function registerDebugHandlers(d: Dispatcher, mgr: DebuggerManager) {
   d.register("page.evalJs", async (raw) => {
     const p = PageEvalJsParamsSchema.parse(raw);
     const tabId = await resolveTabId(p.tabId);
+    // frame: "top" (default) | "focused" | URL regex — reach into cross-origin iframes.
+    const fr = await resolveFrame(mgr, tabId, p.frame);
     const r = await mgr.sendCommand<RuntimeEvaluateResult>(tabId, "Runtime.evaluate", {
       expression: p.expression,
       awaitPromise: p.awaitPromise,
       returnByValue: p.returnByValue,
       timeout: p.timeoutMs,
-    });
+    }, fr.targetId);
+    const frame = fr.frame ? { frame: fr.frame } : {};
     if (r.exceptionDetails) {
-      return { type: "exception", exception: r.exceptionDetails.text };
+      // exceptionDetails.text is often just "Uncaught"; the description has the message.
+      const detail = r.exceptionDetails.exception?.description;
+      return { type: "exception", exception: detail ? `${r.exceptionDetails.text}: ${detail}` : r.exceptionDetails.text, ...frame };
     }
     return {
       type: r.result.type,
       value: r.result.value,
       description: r.result.description,
+      ...frame,
     };
   });
 

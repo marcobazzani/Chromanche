@@ -128,11 +128,35 @@ export const PageSnapshotResultSchema = z
   })
   .strict();
 
+/** A region of the viewport, in CSS pixels. */
+export const ViewportRectSchema = z
+  .object({
+    x: z.number().min(0),
+    y: z.number().min(0),
+    width: z.number().positive(),
+    height: z.number().positive(),
+  })
+  .strict();
+
+/**
+ * Screenshots are captured per tab (CDP) and downscaled so the returned image
+ * stays within what vision models ingest WITHOUT further resizing — otherwise
+ * a 2560px viewport reaches the model as ~1568–2000px and every coordinate it
+ * reads off the image lands on the wrong spot. The result carries the exact
+ * image→page transform (`scale`, `origin`) and the extension remembers it per
+ * tab, so page_click_xy can take image coordinates directly.
+ */
 export const PageScreenshotParamsSchema = z
   .object({
     tabId: z.number().int().optional(),
     format: z.enum(["png", "jpeg"]).default("jpeg"),
     quality: z.number().int().min(1).max(100).default(60),
+    /** Cap on the returned image's long edge, in image pixels. */
+    maxEdge: z.number().int().min(200).max(4096).default(1568),
+    /** Cap on the returned image's total pixels (width × height). */
+    maxPixels: z.number().int().min(40_000).max(16_000_000).default(1_150_000),
+    /** Capture only this viewport region (CSS px) — zoom in to read small text. */
+    clip: ViewportRectSchema.optional(),
   })
   .strict();
 export const PageScreenshotResultSchema = z
@@ -146,8 +170,78 @@ export const PageScreenshotResultSchema = z
       scrollX: z.number(),
       scrollY: z.number(),
     }).optional(),
+    /** Pixel size of the returned image. */
+    image: z.object({ width: z.number().int(), height: z.number().int() }).strict().optional(),
+    /** CSS px per image px: cssX = origin.x + imageX * scale (same for y). */
+    scale: z.number().positive().optional(),
+    /** Viewport position (CSS px) of the image's top-left pixel. */
+    origin: z.object({ x: z.number(), y: z.number() }).strict().optional(),
+    /** "cdp" = this tab's own pixels; "visibleTab" = fallback capture of the visible tab. */
+    capture: z.enum(["cdp", "visibleTab"]).optional(),
   })
   .strict();
+
+/**
+ * Coordinate space for x/y inputs:
+ *  - "screenshot" (default): pixels of the most recent page_screenshot of this
+ *    tab — converted with its scale/origin. Falls back to CSS px when no
+ *    screenshot was taken yet.
+ *  - "css": CSS (viewport) pixels — e.g. a bbox from page_snapshot includeBounds.
+ */
+export const CoordinateSpaceSchema = z.enum(["screenshot", "css"]);
+
+/**
+ * Keyboard modifiers. "ControlOrMeta" is the portable shortcut modifier: ⌘ on
+ * macOS, Ctrl on Windows / Linux / ChromeOS (resolved by the extension from the
+ * BROWSER's OS — not the MCP server's, which may differ, e.g. under WSL).
+ */
+export const ModifierSchema = z.enum(["Alt", "Control", "Meta", "Shift", "ControlOrMeta"]);
+
+/**
+ * A visible popup in the focused document (ARIA role listbox / menu / dialog /
+ * alertdialog) — e.g. an autocomplete list opened by typing. While a list is
+ * open, Enter or Tab usually picks its highlighted item instead of committing
+ * what was typed.
+ */
+export const PopupSchema = z
+  .object({
+    role: z.string(),
+    label: z.string().optional(),
+    /** Number of selectable items (options / menu items) inside it. */
+    items: z.number().int().optional(),
+  })
+  .strict();
+
+/**
+ * Compact post-action focus report returned by input tools after the page
+ * settles (rich editors apply keystrokes asynchronously; reading state
+ * immediately after dispatch shows stale values).
+ */
+export const FocusSummarySchema = z
+  .object({
+    /** origin+path of the frame holding focus, when focus is inside an iframe. */
+    frame: z.string().optional(),
+    tag: z.string(),
+    role: z.string().nullable().optional(),
+    name: z.string().optional(),
+    value: z.string().optional(),
+    text: z.string().optional(),
+    activeDescendantName: z.string().optional(),
+    /** Popups that appeared during the action (all visible ones when no baseline was taken). */
+    popups: z.array(PopupSchema).optional(),
+    /** The focused element reports aria-expanded="true" (its list/menu is open). */
+    expanded: z.boolean().optional(),
+    /** False when the page was still changing when the settle budget ran out. */
+    settled: z.boolean(),
+    waitedMs: z.number(),
+  })
+  .strict();
+
+/**
+ * Optional frame selector for code-running tools: "top" (default), "focused"
+ * (the frame that owns keyboard focus), or a regex tested against frame URLs.
+ */
+export const FrameSelectorSchema = z.string().min(1);
 
 /* ---------- Interaction: click, type, scroll (uid OR selector) ---------- */
 
@@ -182,8 +276,8 @@ export const PageTypeParamsSchema = z
      * Optional. When provided, the element is focused (with self-verification)
      * before typing. When OMITTED, page.type dispatches keystrokes at the
      * current focus without resolving or focusing any element — useful after
-     * a page_click_xy lands on a virtual-canvas cell that doesn't have a uid
-     * (Excel grid cell, Sheets cell, Figma frame). Mirrors the canonical
+     * a page_click_xy lands on a canvas-like widget that doesn't have a uid
+     * (a canvas grid cell, a drawing surface). Mirrors the canonical
      * "screenshot → coordinate click → type at current focus" pattern.
      */
     uid: z.string().min(1).optional(),
@@ -192,17 +286,36 @@ export const PageTypeParamsSchema = z
     submit: z.boolean().default(false),
     clear: z.boolean().default(true),
     requireEmpty: z.boolean().default(false),
-    /** Modifiers held down for the whole text run — use for chords (e.g. Control+a). */
-    modifiers: z.array(z.enum(["Alt", "Control", "Meta", "Shift"])).default([]),
+    /** Modifiers held down for the whole text run — use for chords (e.g. ControlOrMeta+a). */
+    modifiers: z.array(ModifierSchema).default([]),
     /** Skip the actionability gate (visible/stable/enabled) before typing. */
     force: z.boolean().default(false),
     /** Max time to wait for the target to become actionable before failing. */
     timeoutMs: z.number().int().positive().max(120_000).default(5_000),
+    /** Wait for the page to apply the input, then report where focus ended up. */
+    settle: z.boolean().default(true),
+    /**
+     * Keep the field holding exactly the typed text: when the page inline-
+     * completes it (the field shows the typed text plus a suggested remainder),
+     * press Delete to drop the suggestion. Applies to single-field typing into
+     * a field that was empty; needs settle.
+     */
+    exact: z.boolean().default(true),
     includeSnapshot: z.boolean().default(false),
   })
   .strict();
 export const PageTypeResultSchema = z.object({
   ok: z.literal(true),
+  /** Present when the page auto-completed the typed text. */
+  completion: z.object({
+    typed: z.string(),
+    /** What the field showed after typing (typed text + suggestion). */
+    fieldShowed: z.string(),
+    /** The suggestion was dropped and the field now holds exactly the typed text. */
+    removed: z.boolean(),
+    fieldNow: z.string(),
+  }).strict().optional(),
+  focus: FocusSummarySchema.optional(),
   snapshot: z.string().optional(),
 }).strict();
 
@@ -216,8 +329,8 @@ export const PageScrollParamsSchema = z
     to: z.enum(["top", "bottom"]).optional(),
     /**
      * "js" (default): scrollIntoView/scrollTo/scrollBy — preserves prior behaviour.
-     * "wheel": dispatch a real mouseWheel event so virtualized grids (Excel's
-     * canvas) lazy-load rows. Anchors at the uid/selector centre, else viewport centre.
+     * "wheel": dispatch a real mouseWheel event so virtualized grids and lists
+     * lazy-load rows. Anchors at the uid/selector centre, else viewport centre.
      */
     mode: z.enum(["js", "wheel"]).default("js"),
     smooth: z.boolean().default(false),
@@ -249,11 +362,11 @@ export const PageScrollResultSchema = z.object({
 /* ---------- Paste (clipboard → Cmd/Ctrl+V) ---------- */
 
 /**
- * Write `text` to the OS clipboard and synthesize a paste keystroke at the
- * current/specified focus. The reliable primitive for bulk grid fill —
- * Excel for the Web and Google Sheets parse pasted TSV/CSV deterministically
- * (Tab → next cell, newline → next row). No keystroke timing races, no
- * per-cell anchors.
+ * Write `text` to the OS clipboard and synthesize the platform paste
+ * keystroke at the current/specified focus. Many grid widgets split pasted
+ * tab-separated text into cells (Tab → next cell, newline → next row).
+ * REPLACES the user's clipboard (not restored) — use only when the user asked
+ * for a paste.
  *
  * target:
  *  - "current" (default): paste at whatever has document focus.
@@ -269,6 +382,9 @@ export const PagePasteParamsSchema = z
     selector: z.string().min(1).optional(),
     x: z.number().min(0).optional(),
     y: z.number().min(0).optional(),
+    /** Coordinate space for target="xy" (see CoordinateSpaceSchema). */
+    space: CoordinateSpaceSchema.default("screenshot"),
+    settle: z.boolean().default(true),
     includeSnapshot: z.boolean().default(false),
   })
   .strict()
@@ -284,6 +400,11 @@ export const PagePasteResultSchema = z.object({
   ok: z.literal(true),
   /** Number of bytes (text length) written to the clipboard. */
   bytesWritten: z.number().int(),
+  /** A real (trusted) paste event reached the focused document. Never true-by-assumption. */
+  pasteDelivered: z.boolean().optional(),
+  /** The page handled the paste itself (preventDefault) — typical for grids/rich editors. */
+  pasteHandledByPage: z.boolean().optional(),
+  focus: FocusSummarySchema.optional(),
   snapshot: z.string().optional(),
 }).strict();
 
@@ -308,6 +429,8 @@ export const PageWaitParamsSchema = z
     state: z.enum(["attached", "visible", "hidden", "detached"]).default("visible"),
     // function mode — JS expression that must evaluate truthy
     expression: z.string().min(1).optional(),
+    // selector / text / function modes: which frame to evaluate in (default "top")
+    frame: FrameSelectorSchema.optional(),
     // response mode — regex tested against request URL in the network buffer
     urlPattern: z.string().min(1).optional(),
     // loadstate mode
@@ -379,25 +502,34 @@ export const PageHoverResultSchema = z.object({
 /* ---------- Coordinate-click (vision-driven escape hatch) ---------- */
 
 /**
- * Click at absolute viewport coordinates. The escape hatch for virtual-canvas
- * widgets where uid-based clicks don't resolve to specific cells (Excel grid,
- * Sheets, Figma, any custom-rendered surface). Workflow: page_screenshot →
- * model identifies (x, y) from the rendered image → page_click_xy.
+ * Click at a point. The escape hatch for canvas-like widgets where uid-based
+ * clicks don't resolve to specific cells (any custom-rendered surface).
+ * Workflow: page_screenshot → model identifies (x, y) from the rendered image
+ * → page_click_xy.
  *
- * Coordinates are in the active viewport's device-independent pixels.
+ * By default x/y are pixels of the latest page_screenshot of this tab (the
+ * extension converts them with that screenshot's scale/origin); pass
+ * space:"css" for CSS viewport pixels (e.g. page_snapshot bboxes).
  */
 export const PageClickXyParamsSchema = z
   .object({
     tabId: z.number().int(),
     x: z.number().min(0),
     y: z.number().min(0),
+    space: CoordinateSpaceSchema.default("screenshot"),
     button: z.enum(["left", "right", "middle"]).default("left"),
     clickCount: z.number().int().min(1).max(3).default(1),
+    settle: z.boolean().default(true),
     includeSnapshot: z.boolean().default(false),
   })
   .strict();
 export const PageClickXyResultSchema = z.object({
   ok: z.literal(true),
+  /** The CSS viewport point that was actually clicked. */
+  point: z.object({ x: z.number(), y: z.number() }).strict().optional(),
+  /** Space the inputs were interpreted in ("css" when no screenshot existed yet). */
+  spaceUsed: CoordinateSpaceSchema.optional(),
+  focus: FocusSummarySchema.optional(),
   snapshot: z.string().optional(),
 }).strict();
 
@@ -405,9 +537,9 @@ export const PageClickXyResultSchema = z.object({
 
 /**
  * Make a target element the active element, with verification. Useful when
- * an SPA's input pipeline ignores plain JS focus() (Excel for the Web grid,
- * Sheets, Figma) — the model can escalate explicitly via mode, and gets back
- * an honest report of the actual activeElement when the focus didn't take.
+ * an SPA's input pipeline ignores plain JS focus() — the model can escalate
+ * explicitly via mode, and gets back an honest report of the actual
+ * activeElement when the focus didn't take.
  *
  * Mode semantics:
  *  - auto:        try JS focus → verify → escalate to coordinate-click on mismatch.
@@ -449,12 +581,14 @@ export const PagePressKeyParamsSchema = z
   .object({
     tabId: z.number().int(),
     key: z.string().min(1),
-    modifiers: z.array(z.enum(["Alt", "Control", "Meta", "Shift"])).default([]),
+    modifiers: z.array(ModifierSchema).default([]),
+    settle: z.boolean().default(true),
     includeSnapshot: z.boolean().default(false),
   })
   .strict();
 export const PagePressKeyResultSchema = z.object({
   ok: z.literal(true),
+  focus: FocusSummarySchema.optional(),
   snapshot: z.string().optional(),
 }).strict();
 
@@ -495,6 +629,10 @@ export const PageFocusStateResultSchema = z.object({
   }).optional(),
   ariaRowIndex: z.string().optional(),
   ariaColIndex: z.string().optional(),
+  /** aria-expanded of the focused element ("true" while its list/menu is open). */
+  activeExpanded: z.string().nullable().optional(),
+  /** Visible popups (listbox / menu / dialog / alertdialog) in the focused document. */
+  popups: z.array(PopupSchema).optional(),
 }).strict();
 
 /* ---------- Fill form (batch) ---------- */
@@ -661,12 +799,16 @@ export const PageEvalJsParamsSchema = z.object({
   awaitPromise: z.boolean().default(true),
   returnByValue: z.boolean().default(true),
   timeoutMs: z.number().int().positive().max(30_000).default(5_000),
+  /** "top" (default) | "focused" | regex over frame URLs — reach into cross-origin iframes. */
+  frame: FrameSelectorSchema.optional(),
 }).strict();
 export const PageEvalJsResultSchema = z.object({
   type: z.string(),
   value: z.unknown().optional(),
   description: z.string().optional(),
   exception: z.string().optional(),
+  /** origin+path of the frame the expression ran in, when not the top frame. */
+  frame: z.string().optional(),
 }).strict();
 
 export const ConsoleEntrySchema = z.object({

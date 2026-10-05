@@ -18,6 +18,18 @@ import {
 } from "@chromanche/shared";
 import { resolveUid } from "../lib/snapshot-manager.js";
 import { takeA11ySnapshot } from "./page-read.js";
+import {
+  KEY_DEFS,
+  MOD_SHIFT,
+  charToKeyDef,
+  dispatchKey,
+  modifierFlags,
+  resolveKey,
+  shortcutModifier,
+} from "../lib/keyboard.js";
+import { isMacBrowser } from "../lib/platform.js";
+import { focusedKeyboardTarget, readFocusState, settleFocus, type FocusState, type PopupBaseline } from "../lib/focus.js";
+import { toCssPoint } from "../lib/screenshot-transform.js";
 
 /* ---------- helpers ---------- */
 
@@ -26,6 +38,8 @@ interface ResolvedElement {
   /** undefined = main tab frame; otherwise the OOPIF's CDP targetId. */
   targetId?: string;
 }
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /**
  * Resolve a uid to a CDP objectId.
@@ -54,7 +68,6 @@ async function resolveElement(
     return { objectId: r.object.objectId, targetId: entry.targetId };
   }
   if (selector) {
-    // Get document root, then querySelector.
     const doc = await mgr.sendCommand<{ root: { nodeId: number } }>(tabId, "DOM.getDocument", {});
     const q = await mgr.sendCommand<{ nodeId: number }>(
       tabId,
@@ -73,8 +86,25 @@ async function resolveElement(
   throw new Error("provide either uid or selector");
 }
 
+/** Call a function with `this` = element (in its own frame session) and return its value. */
+async function callOn<T>(
+  mgr: DebuggerManager,
+  tabId: number,
+  el: ResolvedElement,
+  functionDeclaration: string,
+  args: unknown[] = [],
+): Promise<T> {
+  const r = await mgr.sendCommand<{ result: { value?: T } }>(tabId, "Runtime.callFunctionOn", {
+    objectId: el.objectId,
+    functionDeclaration,
+    arguments: args.map((value) => ({ value })),
+    returnByValue: true,
+  }, el.targetId);
+  return r.result.value as T;
+}
+
 /**
- * Get the center coordinates of an element for CDP mouse events.
+ * Center of an element's content box, scrolled into view first.
  *
  * Coords are session-local: when `targetId` is set, x/y are relative to
  * the iframe's viewport and the caller must dispatch mouse events on
@@ -86,23 +116,28 @@ async function getElementCenter(
   objectId: string,
   targetId?: string,
 ): Promise<{ x: number; y: number }> {
-  // scrollIntoViewIfNeeded first.
   await mgr.sendCommand(tabId, "Runtime.callFunctionOn", {
     objectId,
     functionDeclaration: `function() { this.scrollIntoViewIfNeeded(true); }`,
     returnByValue: true,
   }, targetId);
+  return boxCenter(mgr, tabId, objectId, targetId);
+}
+
+async function boxCenter(
+  mgr: DebuggerManager,
+  tabId: number,
+  objectId: string,
+  targetId?: string,
+): Promise<{ x: number; y: number }> {
   const box = await mgr.sendCommand<{ model: { content: number[] } }>(
     tabId,
     "DOM.getBoxModel",
     { objectId },
     targetId,
   );
-  // content quad: [x1,y1, x2,y2, x3,y3, x4,y4]
   const q = box.model.content;
-  const x = (q[0] + q[2] + q[4] + q[6]) / 4;
-  const y = (q[1] + q[3] + q[5] + q[7]) / 4;
-  return { x, y };
+  return { x: (q[0]! + q[2]! + q[4]! + q[6]!) / 4, y: (q[1]! + q[3]! + q[5]! + q[7]!) / 4 };
 }
 
 async function maybeSnapshot(
@@ -112,7 +147,7 @@ async function maybeSnapshot(
 ): Promise<string | undefined> {
   if (!include) return undefined;
   // Small delay to let the page react (e.g. form validation, dropdown open).
-  await new Promise((r) => setTimeout(r, 150));
+  await sleep(150);
   return takeA11ySnapshot(mgr, tabId);
 }
 
@@ -141,6 +176,38 @@ function translateCdpError(e: unknown): Error {
   return e instanceof Error ? e : new Error(msg);
 }
 
+type MouseButton = "left" | "right" | "middle";
+
+/** DOM MouseEvent.buttons bitmask (what CDP's `buttons` expects): left=1, right=2, middle=4. */
+function buttonsMask(button: MouseButton): number {
+  return button === "right" ? 2 : button === "middle" ? 4 : 1;
+}
+
+/**
+ * A human-shaped click: move the pointer there first (hover state, pointer
+ * tracking — some grids ignore a press that arrives without a prior move),
+ * then press/release `clickCount` times.
+ */
+async function mouseClickAt(
+  mgr: DebuggerManager,
+  tabId: number,
+  x: number,
+  y: number,
+  button: MouseButton = "left",
+  clickCount = 1,
+  targetId?: string,
+): Promise<void> {
+  await mgr.sendCommand(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y, button: "none", buttons: 0 }, targetId);
+  for (let i = 1; i <= clickCount; i++) {
+    await mgr.sendCommand(tabId, "Input.dispatchMouseEvent", {
+      type: "mousePressed", x, y, button, buttons: buttonsMask(button), clickCount: i,
+    }, targetId);
+    await mgr.sendCommand(tabId, "Input.dispatchMouseEvent", {
+      type: "mouseReleased", x, y, button, buttons: 0, clickCount: i,
+    }, targetId);
+  }
+}
+
 /** Click at element coordinates without needing JS access (works through cross-extension overlays). */
 async function coordinateClick(
   mgr: DebuggerManager,
@@ -148,15 +215,7 @@ async function coordinateClick(
   objectId: string,
   targetId?: string,
 ): Promise<void> {
-  const box = await mgr.sendCommand<{ model: { content: number[] } }>(
-    tabId,
-    "DOM.getBoxModel",
-    { objectId },
-    targetId,
-  );
-  const q = box.model.content;
-  const x = (q[0] + q[2] + q[4] + q[6]) / 4;
-  const y = (q[1] + q[3] + q[5] + q[7]) / 4;
+  const { x, y } = await boxCenter(mgr, tabId, objectId, targetId);
   await mgr.sendCommand(tabId, "Input.dispatchMouseEvent", {
     type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1,
   }, targetId);
@@ -180,8 +239,8 @@ interface FocusActualState {
  * (coordinate-click, blur+click) or surface a structured error to the model.
  *
  * Runs in the element's own document via the same CDP session we used to
- * resolve it, which is critical for OOPIFs (Excel for the Web's grid lives
- * inside an Office iframe).
+ * resolve it, which is critical for OOPIFs (editors that live inside
+ * cross-origin iframes).
  */
 async function verifyFocus(
   mgr: DebuggerManager,
@@ -272,7 +331,7 @@ async function focusAuto(
  * non-zero box, isn't visibility:hidden / display:none, isn't disabled /
  * aria-disabled, and has a stable position across two samples (catches
  * mid-animation). Runs in the element's own session, so it works inside
- * OOPIFs (Excel / Office addin frames).
+ * cross-origin iframes (OOPIFs).
  */
 interface ActionableState {
   actionable: boolean;
@@ -289,12 +348,13 @@ export async function waitForActionable(
   let last: { x: number; y: number } | undefined;
   let lastReason = "not-ready";
   for (;;) {
-    const r = await mgr.sendCommand<{ result: { value: { ok: boolean; reason?: string; x?: number; y?: number } } }>(
+    const r = await mgr.sendCommand<{ result: { value?: { ok: boolean; reason?: string; x?: number; y?: number } } }>(
       tabId,
       "Runtime.callFunctionOn",
       {
         objectId: el.objectId,
         functionDeclaration: `function() {
+          if (!(this instanceof Element)) return { ok:false, reason:"not-an-element" };
           if (!this.isConnected) return { ok:false, reason:"detached" };
           const r = this.getBoundingClientRect();
           if (r.width === 0 || r.height === 0) return { ok:false, reason:"zero-size" };
@@ -307,7 +367,8 @@ export async function waitForActionable(
       },
       el.targetId,
     );
-    const v = r.result.value;
+    // An exception inside the predicate yields no value — treat as not ready, never crash.
+    const v = r.result?.value ?? { ok: false, reason: "not-inspectable" };
     if (v.ok) {
       // Require positional stability across two samples to avoid acting mid-animation.
       if (last && Math.abs(last.x - (v.x ?? 0)) <= 1 && Math.abs(last.y - (v.y ?? 0)) <= 1) {
@@ -319,7 +380,7 @@ export async function waitForActionable(
       last = undefined;
     }
     if (Date.now() >= deadline) return { actionable: false, reason: lastReason };
-    await new Promise((res) => setTimeout(res, 60));
+    await sleep(60);
   }
 }
 
@@ -346,252 +407,14 @@ function inPageScroll(
   return { ok: true as const };
 }
 
-/* ---------- KEY MAP for CDP Input.dispatchKeyEvent ---------- */
-
-const KEY_DEFS: Record<string, { key: string; code: string; keyCode: number; text?: string }> = {
-  Enter:      { key: "Enter",     code: "Enter",       keyCode: 13, text: "\r" },
-  Tab:        { key: "Tab",       code: "Tab",         keyCode: 9 },
-  Escape:     { key: "Escape",    code: "Escape",      keyCode: 27 },
-  Backspace:  { key: "Backspace", code: "Backspace",   keyCode: 8 },
-  Delete:     { key: "Delete",    code: "Delete",      keyCode: 46 },
-  ArrowUp:    { key: "ArrowUp",   code: "ArrowUp",     keyCode: 38 },
-  ArrowDown:  { key: "ArrowDown", code: "ArrowDown",   keyCode: 40 },
-  ArrowLeft:  { key: "ArrowLeft", code: "ArrowLeft",    keyCode: 37 },
-  ArrowRight: { key: "ArrowRight",code: "ArrowRight",   keyCode: 39 },
-  Home:       { key: "Home",      code: "Home",        keyCode: 36 },
-  End:        { key: "End",       code: "End",         keyCode: 35 },
-  PageUp:     { key: "PageUp",    code: "PageUp",      keyCode: 33 },
-  PageDown:   { key: "PageDown",  code: "PageDown",    keyCode: 34 },
-  Space:      { key: " ",         code: "Space",       keyCode: 32, text: " " },
-  F1:         { key: "F1",        code: "F1",          keyCode: 112 },
-  F2:         { key: "F2",        code: "F2",          keyCode: 113 },
-  F3:         { key: "F3",        code: "F3",          keyCode: 114 },
-  F4:         { key: "F4",        code: "F4",          keyCode: 115 },
-  F5:         { key: "F5",        code: "F5",          keyCode: 116 },
-  F6:         { key: "F6",        code: "F6",          keyCode: 117 },
-  F7:         { key: "F7",        code: "F7",          keyCode: 118 },
-  F8:         { key: "F8",        code: "F8",          keyCode: 119 },
-  F9:         { key: "F9",        code: "F9",          keyCode: 120 },
-  F10:        { key: "F10",       code: "F10",         keyCode: 121 },
-  F11:        { key: "F11",       code: "F11",         keyCode: 122 },
-  F12:        { key: "F12",       code: "F12",         keyCode: 123 },
-};
-
-function resolveKey(key: string) {
-  if (KEY_DEFS[key]) return KEY_DEFS[key];
-  // Single character.
-  if (key.length === 1) {
-    const code = `Key${key.toUpperCase()}`;
-    return { key, code, keyCode: key.toUpperCase().charCodeAt(0), text: key };
-  }
-  // Pass through unknown keys as-is.
-  return { key, code: key, keyCode: 0 };
-}
-
-function modifierFlags(mods: string[]): number {
-  let flags = 0;
-  for (const m of mods) {
-    if (m === "Alt") flags |= 1;
-    if (m === "Control") flags |= 2;
-    if (m === "Meta") flags |= 4;
-    if (m === "Shift") flags |= 8;
-  }
-  return flags;
-}
+/* ---------- Emptiness guard (requireEmpty) ---------- */
 
 /**
- * Send a single key (keyDown + keyUp) via CDP. Targets the focused element
- * in either the tab session or an OOPIF frame session (when targetId given).
- * Real keyboard events — required for apps that don't honor Input.insertText
- * (Office365 / Excel for the Web, Google Sheets, anything with custom input
- * pipelines).
+ * Generic content check on the focused element (or its active descendant):
+ * value, text or selected text. Apps that expose content ONLY through an
+ * accessible name are not covered — the caller can inspect
+ * focus.activeDescendantName for those.
  */
-async function dispatchKey(
-  mgr: DebuggerManager,
-  tabId: number,
-  kd: { key: string; code: string; keyCode: number; text?: string },
-  modifiers: number,
-  targetId?: string,
-): Promise<void> {
-  await mgr.sendCommand(tabId, "Input.dispatchKeyEvent", {
-    type: "keyDown",
-    key: kd.key,
-    code: kd.code,
-    windowsVirtualKeyCode: kd.keyCode,
-    nativeVirtualKeyCode: kd.keyCode,
-    modifiers,
-    text: kd.text,
-  }, targetId);
-  await mgr.sendCommand(tabId, "Input.dispatchKeyEvent", {
-    type: "keyUp",
-    key: kd.key,
-    code: kd.code,
-    windowsVirtualKeyCode: kd.keyCode,
-    nativeVirtualKeyCode: kd.keyCode,
-    modifiers,
-  }, targetId);
-}
-
-async function documentHasFocus(
-  mgr: DebuggerManager,
-  tabId: number,
-  targetId?: string,
-): Promise<boolean> {
-  try {
-    const r = await mgr.sendCommand<{ result: { value?: boolean } }>(
-      tabId,
-      "Runtime.evaluate",
-      { expression: "document.hasFocus()", returnByValue: true },
-      targetId,
-    );
-    return r.result.value === true;
-  } catch {
-    return false;
-  }
-}
-
-function frameDepth(targetId: string, parents: Map<string, string | undefined>): number {
-  let depth = 0;
-  let cur: string | undefined = targetId;
-  while (cur) {
-    depth++;
-    cur = parents.get(cur);
-  }
-  return depth;
-}
-
-/**
- * Dispatch at the page's actual focused document. Virtualized editors often
- * keep their active surface inside an OOPIF; sending arrows/Tab/Enter only
- * to the top tab session can miss the frame that owns focus.
- */
-async function focusedKeyboardTarget(
-  mgr: DebuggerManager,
-  tabId: number,
-): Promise<string | undefined> {
-  await mgr.syncFrameTargets(tabId);
-  const frames = mgr.getFrameTargets(tabId);
-  const parents = new Map(frames.map((f) => [f.targetId, f.parentTargetId]));
-  const deepestFirst = [...frames]
-    .sort((a, b) => frameDepth(b.targetId, parents) - frameDepth(a.targetId, parents));
-
-  for (const frame of deepestFirst) {
-    if (await documentHasFocus(mgr, tabId, frame.targetId)) {
-      return frame.targetId;
-    }
-  }
-
-  return undefined;
-}
-
-async function dispatchKeyAtCurrentFocus(
-  mgr: DebuggerManager,
-  tabId: number,
-  kd: { key: string; code: string; keyCode: number; text?: string },
-  modifiers: number,
-): Promise<void> {
-  await dispatchKey(mgr, tabId, kd, modifiers, await focusedKeyboardTarget(mgr, tabId));
-}
-
-interface FocusState {
-  ok: true;
-  targetId?: string;
-  url: string;
-  title: string;
-  documentHasFocus: boolean;
-  activeTag: string;
-  activeRole?: string | null;
-  activeName?: string;
-  activeValue?: string;
-  activeText?: string;
-  selectedText?: string;
-  selectionStart?: number | null;
-  selectionEnd?: number | null;
-  activeDescendant?: string;
-  activeDescendantTag?: string;
-  activeDescendantRole?: string | null;
-  activeDescendantName?: string;
-  activeDescendantValue?: string;
-  activeDescendantText?: string;
-  activeDescendantRowIndex?: string;
-  activeDescendantColIndex?: string;
-  activeDescendantBounds?: { x: number; y: number; width: number; height: number };
-  ariaRowIndex?: string;
-  ariaColIndex?: string;
-}
-
-async function readFocusState(
-  mgr: DebuggerManager,
-  tabId: number,
-  targetId?: string,
-): Promise<FocusState> {
-  const r = await mgr.sendCommand<{ result: { value: Omit<FocusState, "ok" | "targetId"> } }>(
-    tabId,
-    "Runtime.evaluate",
-    {
-      expression: `(() => {
-        const doc = document;
-        const active = doc.activeElement;
-        const readAttr = (el, name) => el && el.getAttribute ? el.getAttribute(name) || undefined : undefined;
-        const accessibleName = (el) => el ? (
-          readAttr(el, "aria-label") ||
-          readAttr(el, "placeholder") ||
-          readAttr(el, "name") ||
-          readAttr(el, "title") ||
-          (el.textContent || "").trim().slice(0, 200) ||
-          undefined
-        ) : undefined;
-        const elementValue = (el) => el && "value" in el ? String(el.value ?? "") : undefined;
-        const elementText = (el, max = 500) => el ? (el.textContent || "").trim().slice(0, max) || undefined : undefined;
-        const bounds = (el) => {
-          if (!el || typeof el.getBoundingClientRect !== "function") return undefined;
-          const r = el.getBoundingClientRect();
-          if (!Number.isFinite(r.width) || !Number.isFinite(r.height)) return undefined;
-          return { x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) };
-        };
-        const value = active && "value" in active ? String(active.value ?? "") : undefined;
-        const selectionStart = active && "selectionStart" in active ? active.selectionStart : undefined;
-        const selectionEnd = active && "selectionEnd" in active ? active.selectionEnd : undefined;
-        let selectedText = "";
-        if (typeof selectionStart === "number" && typeof selectionEnd === "number" && value !== undefined) {
-          selectedText = value.slice(selectionStart, selectionEnd);
-        } else {
-          selectedText = String(doc.getSelection ? doc.getSelection() || "" : "");
-        }
-        const activeDescendant = readAttr(active, "aria-activedescendant");
-        const descendant = activeDescendant ? doc.getElementById(activeDescendant) : null;
-        return {
-          url: location.href,
-          title: doc.title,
-          documentHasFocus: doc.hasFocus(),
-          activeTag: active && active.tagName ? active.tagName.toLowerCase() : "body",
-          activeRole: readAttr(active, "role") ?? null,
-          activeName: accessibleName(active),
-          activeValue: elementValue(active),
-          activeText: elementText(active),
-          selectedText: selectedText || undefined,
-          selectionStart: selectionStart ?? undefined,
-          selectionEnd: selectionEnd ?? undefined,
-          activeDescendant,
-          activeDescendantTag: descendant && descendant.tagName ? descendant.tagName.toLowerCase() : undefined,
-          activeDescendantRole: readAttr(descendant, "role") ?? undefined,
-          activeDescendantName: accessibleName(descendant),
-          activeDescendantValue: elementValue(descendant),
-          activeDescendantText: elementText(descendant),
-          activeDescendantRowIndex: readAttr(descendant, "aria-rowindex"),
-          activeDescendantColIndex: readAttr(descendant, "aria-colindex"),
-          activeDescendantBounds: bounds(descendant),
-          ariaRowIndex: readAttr(active, "aria-rowindex"),
-          ariaColIndex: readAttr(active, "aria-colindex"),
-        };
-      })()`,
-      returnByValue: true,
-    },
-    targetId,
-  );
-  return { ok: true, targetId, ...r.result.value };
-}
-
 function firstNonEmptyText(state: FocusState): { source: string; text: string } | undefined {
   const candidates: Array<[string, string | undefined]> = state.activeDescendant
     ? [
@@ -632,59 +455,235 @@ async function assertEmptyFocusTarget(
   );
 }
 
-/**
- * US-keyboard virtual key codes for punctuation. Critical for typing into
- * apps that branch on keyCode at the keydown level (Excel for the Web,
- * Sheets, anything with custom shortcut handling). Without this map, "." was
- * dispatched with keyCode 46 — which is Delete — and Excel ate the period
- * during edit-mode insertion, silently corrupting emails, URLs, decimals.
- *
- * Sources: KeyboardEvent.keyCode legacy table (Mozilla docs), windows
- * virtual-key codes for the standard US layout.
- */
-const PUNCT_KEYCODES: Record<string, { code: string; keyCode: number }> = {
-  " ":  { code: "Space",        keyCode: 32  },
-  ".":  { code: "Period",       keyCode: 190 },
-  ",":  { code: "Comma",        keyCode: 188 },
-  ";":  { code: "Semicolon",    keyCode: 186 },
-  "'":  { code: "Quote",        keyCode: 222 },
-  "/":  { code: "Slash",        keyCode: 191 },
-  "\\": { code: "Backslash",    keyCode: 220 },
-  "[":  { code: "BracketLeft",  keyCode: 219 },
-  "]":  { code: "BracketRight", keyCode: 221 },
-  "-":  { code: "Minus",        keyCode: 189 },
-  "=":  { code: "Equal",        keyCode: 187 },
-  "`":  { code: "Backquote",    keyCode: 192 },
-};
+/* ---------- Clearing a field through real input ---------- */
+
+type ClearOutcome = "cleared" | "already-empty" | "not-editable" | "failed";
+
+const READ_EDITABLE_TEXT = `function() {
+  if (this instanceof HTMLInputElement || this instanceof HTMLTextAreaElement) return String(this.value || "");
+  return String(this.textContent || "");
+}`;
 
 /**
- * Build a CDP key descriptor for a single character. Mirrors what resolveKey
- * does for single chars, plus a few common control mappings (\n → Enter, \t
- * → Tab) that page_type callers tend to embed in text.
- *
- * For characters we don't have a deterministic virtual-key for (every
- * non-letter, non-digit, non-mapped-punctuation), we send windowsVirtualKey-
- * Code 0 so apps don't accidentally fire shortcut handlers — the `text`
- * field is what gets inserted regardless.
+ * Empty an input/textarea/contenteditable the way a person would: select its
+ * contents, press Backspace, and verify. Assigning value/textContent directly
+ * bypasses frameworks and rich editors that keep their own model (the next
+ * typed text then gets merged with the old content).
  */
-function charToKeyDef(ch: string): { key: string; code: string; keyCode: number; text?: string } {
-  if (ch === "\n" || ch === "\r") return KEY_DEFS.Enter!;
-  if (ch === "\t") return KEY_DEFS.Tab!;
-  const upper = ch.toUpperCase();
-  if (/^[A-Z]$/.test(upper)) {
-    return { key: ch, code: `Key${upper}`, keyCode: upper.charCodeAt(0), text: ch };
+async function clearField(
+  mgr: DebuggerManager,
+  tabId: number,
+  el: ResolvedElement,
+  mac: boolean,
+): Promise<{ outcome: ClearOutcome; remaining?: string }> {
+  const kind = await callOn<"input" | "editable" | "empty" | "none">(mgr, tabId, el, `function() {
+    const textual = (this instanceof HTMLTextAreaElement) ||
+      (this instanceof HTMLInputElement && !/^(checkbox|radio|file|button|submit|reset|image|color|range|hidden)$/i.test(this.type));
+    if (textual) {
+      if (this.value === "") return "empty";
+      try { this.select(); } catch (e) {}
+      return "input";
+    }
+    if (this.isContentEditable) return (this.textContent || "") === "" ? "empty" : "editable";
+    return "none";
+  }`);
+  if (kind === "empty") return { outcome: "already-empty" };
+  if (kind === "none") return { outcome: "not-editable" };
+
+  const selectAllKey = { key: "a", code: "KeyA", keyCode: 65 };
+  const selectAll = () => dispatchKey(mgr, tabId, selectAllKey, shortcutModifier(mac), el.targetId, mac);
+  const backspace = () => dispatchKey(mgr, tabId, KEY_DEFS.Backspace!, 0, el.targetId, mac);
+  const remaining = () => callOn<string>(mgr, tabId, el, READ_EDITABLE_TEXT);
+
+  // Inputs: select() covers the value for text-like types; email/number reject
+  // selection APIs, so fall back to the platform select-all shortcut.
+  if (kind === "input") {
+    const covered = await callOn<boolean>(mgr, tabId, el, `function() {
+      try { return this.selectionStart === 0 && this.selectionEnd === this.value.length; } catch (e) { return false; }
+    }`);
+    if (!covered) await selectAll();
+  } else {
+    await selectAll();
   }
-  if (/^[0-9]$/.test(ch)) {
-    return { key: ch, code: `Digit${ch}`, keyCode: ch.charCodeAt(0), text: ch };
+  await backspace();
+  let left = await remaining();
+  if (left === "") return { outcome: "cleared" };
+
+  // Second chance for contenteditables whose app didn't scope select-all to
+  // the element: select exactly the node's contents via the Selection API.
+  if (kind === "editable") {
+    await callOn(mgr, tabId, el, `function() {
+      const doc = this.ownerDocument, sel = doc.getSelection(), range = doc.createRange();
+      range.selectNodeContents(this); sel.removeAllRanges(); sel.addRange(range);
+    }`);
+    await backspace();
+    left = await remaining();
+    if (left === "") return { outcome: "cleared" };
   }
-  const punct = PUNCT_KEYCODES[ch];
-  if (punct) return { key: ch, code: punct.code, keyCode: punct.keyCode, text: ch };
-  // Unknown character (shifted punctuation like @, extended ASCII, accented
-  // letters, emoji): keep `code` non-empty (CDP/Chrome rejects empty code in
-  // some versions and crashes the dispatch) but use windowsVirtualKeyCode 0
-  // so apps don't accidentally fire shortcut/control handlers tied to
-  // ambiguous keyCodes. The `text` field is what gets inserted.
-  return { key: ch, code: ch, keyCode: 0, text: ch };
+  return { outcome: "failed", remaining: left };
+}
+
+/* ---------- Typed-text fidelity (inline completion) ---------- */
+
+/** Text of a field: input/textarea value, contenteditable text; null when not a text field. */
+const READ_FIELD_TEXT = `function() {
+  if (this instanceof HTMLInputElement || this instanceof HTMLTextAreaElement) return String(this.value || "");
+  if (this.isContentEditable) return String(this.textContent || "");
+  return null;
+}`;
+
+const READ_ACTIVE_FIELD_TEXT = `(() => {
+  const a = document.activeElement;
+  if (!a) return null;
+  if (a instanceof HTMLInputElement || a instanceof HTMLTextAreaElement) return String(a.value || "");
+  if (a.isContentEditable) return String(a.textContent || "");
+  return null;
+})()`;
+
+type FieldReader = () => Promise<string | null>;
+
+function fieldReader(mgr: DebuggerManager, tabId: number, el: ResolvedElement | undefined, targetId: string | undefined): FieldReader {
+  if (el) {
+    return async () => {
+      const v = await callOn<unknown>(mgr, tabId, el, READ_FIELD_TEXT).catch(() => null);
+      return typeof v === "string" ? v : null;
+    };
+  }
+  return async () => {
+    try {
+      const r = await mgr.sendCommand<{ result?: { value?: unknown } }>(
+        tabId, "Runtime.evaluate", { expression: READ_ACTIVE_FIELD_TEXT, returnByValue: true }, targetId,
+      );
+      return typeof r.result?.value === "string" ? r.result.value : null;
+    } catch {
+      return null;
+    }
+  };
+}
+
+export interface CompletionReport {
+  typed: string;
+  fieldShowed: string;
+  removed: boolean;
+  fieldNow: string;
+}
+
+/**
+ * Many widgets inline-complete what you type (search boxes, comboboxes,
+ * address bars, spreadsheet cells): the field shows the typed text followed by
+ * a suggested remainder, which Enter/Tab would then accept. When the field was
+ * empty before typing and now holds the typed text plus more, press Delete —
+ * the standard way to drop an inline suggestion — and report what happened.
+ */
+async function dropInlineCompletion(
+  mgr: DebuggerManager,
+  tabId: number,
+  typed: string,
+  read: FieldReader,
+  targetId: string | undefined,
+  mac: boolean,
+): Promise<CompletionReport | undefined> {
+  const shown = await read();
+  if (shown === null || shown === typed || shown.length <= typed.length || !shown.startsWith(typed)) return undefined;
+  await dispatchKey(mgr, tabId, KEY_DEFS.Delete!, 0, targetId, mac);
+  let now = await read();
+  for (let i = 0; i < 15 && now !== typed; i++) {
+    await sleep(40);
+    now = await read();
+  }
+  return { typed, fieldShowed: shown, removed: now === typed, fieldNow: now ?? "" };
+}
+
+/** Popups visible in a frame before an action — the baseline for "what did this action open?". */
+async function popupBaseline(mgr: DebuggerManager, tabId: number, targetId: string | undefined): Promise<PopupBaseline | undefined> {
+  try {
+    const s = await readFocusState(mgr, tabId, targetId);
+    return { targetId, popups: s.popups ?? [] };
+  } catch {
+    return undefined;
+  }
+}
+
+/* ---------- Paste plumbing ---------- */
+
+const PASTE_PROBE_KEY = "__chromanchePasteProbe";
+
+/**
+ * Arm a one-shot observer for the next TRUSTED paste event in a frame. Capture
+ * phase records delivery; the bubble phase (or a 0ms timer when the page stops
+ * propagation) records whether the page took it over (preventDefault).
+ */
+const ARM_PASTE_PROBE = `(() => {
+  const K = ${JSON.stringify(PASTE_PROBE_KEY)};
+  try { const prev = window[K]; if (prev && prev.dispose) prev.dispose(); } catch (e) {}
+  const probe = { fired: false, prevented: null, target: null };
+  const cap = (e) => {
+    if (!e.isTrusted) return;
+    probe.fired = true;
+    const t = e.target;
+    probe.target = t && t.tagName ? t.tagName.toLowerCase() : null;
+    setTimeout(() => { if (probe.prevented === null) probe.prevented = e.defaultPrevented; }, 0);
+  };
+  const bub = (e) => { if (e.isTrusted) probe.prevented = e.defaultPrevented; };
+  window.addEventListener("paste", cap, true);
+  window.addEventListener("paste", bub, false);
+  probe.dispose = () => {
+    window.removeEventListener("paste", cap, true);
+    window.removeEventListener("paste", bub, false);
+  };
+  Object.defineProperty(window, K, { value: probe, configurable: true, enumerable: false, writable: true });
+  return true;
+})()`;
+
+const READ_PASTE_PROBE = `(() => {
+  const p = window[${JSON.stringify(PASTE_PROBE_KEY)}];
+  return p ? { fired: p.fired, prevented: p.prevented, target: p.target } : null;
+})()`;
+
+const DISPOSE_PASTE_PROBE = `(() => {
+  const K = ${JSON.stringify(PASTE_PROBE_KEY)};
+  const p = window[K];
+  if (p && p.dispose) p.dispose();
+  try { delete window[K]; } catch (e) {}
+  return true;
+})()`;
+
+/**
+ * Put text on the system clipboard from the focused frame without moving
+ * focus: async Clipboard API first; else run the copy command with a one-shot
+ * listener that substitutes our text (the page's own copy handlers are
+ * suppressed). Both need the document focused + a user gesture, which
+ * Runtime.evaluate(userGesture) provides.
+ */
+function writeClipboardExpr(text: string): string {
+  return `(async (text) => {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+        return "clipboard-api";
+      }
+    } catch (e) {}
+    let ok = false;
+    const onCopy = (e) => {
+      try { e.clipboardData.setData("text/plain", text); e.preventDefault(); e.stopImmediatePropagation(); ok = true; } catch (err) {}
+    };
+    window.addEventListener("copy", onCopy, true);
+    try { document.execCommand("copy"); } catch (e) {} finally { window.removeEventListener("copy", onCopy, true); }
+    return ok ? "copy-event" : "failed";
+  })(${JSON.stringify(text)})`;
+}
+
+async function evalIn<T>(
+  mgr: DebuggerManager,
+  tabId: number,
+  targetId: string | undefined,
+  expression: string,
+  extra: Record<string, unknown> = {},
+): Promise<T | undefined> {
+  const r = await mgr.sendCommand<{ result?: { value?: T } }>(
+    tabId, "Runtime.evaluate", { expression, returnByValue: true, ...extra }, targetId,
+  );
+  return r.result?.value;
 }
 
 /* ---------- handlers ---------- */
@@ -704,63 +703,64 @@ export function registerPageInteractHandlers(d: Dispatcher, mgr: DebuggerManager
       }
     }
     const { x, y } = await getElementCenter(mgr, p.tabId, el.objectId, el.targetId);
-    const btn = p.button === "right" ? 2 : p.button === "middle" ? 1 : 0;
-    const btnName = p.button === "right" ? "right" : p.button === "middle" ? "middle" : "left";
-    await mgr.sendCommand(p.tabId, "Input.dispatchMouseEvent", {
-      type: "mousePressed", x, y, button: btnName, buttons: 1 << btn, clickCount: 1,
-    }, el.targetId);
-    await mgr.sendCommand(p.tabId, "Input.dispatchMouseEvent", {
-      type: "mouseReleased", x, y, button: btnName, buttons: 0, clickCount: 1,
-    }, el.targetId);
+    await mouseClickAt(mgr, p.tabId, x, y, p.button, 1, el.targetId);
     const snapshot = await maybeSnapshot(mgr, p.tabId, p.includeSnapshot);
     return { ok: true as const, snapshot };
   });
 
-  // page.clickXy: dispatch a click at absolute viewport coords. The model
-  // discovers coords visually from a screenshot — the escape hatch for
-  // virtual-canvas widgets where uid bbox centers don't map to anything
-  // meaningful (Excel grid cells, Sheets, Figma). No element resolution,
-  // no targetId — coordinates are top-frame-viewport relative, which
-  // matches the screenshot the model is reading from.
+  // page.clickXy: the vision escape hatch for canvas-like widgets where no
+  // element maps to the target. x/y default to pixels of the latest
+  // screenshot of this tab and are mapped back to CSS viewport px with its
+  // transform — the image the model sees is downscaled, so raw image
+  // coordinates are NOT viewport coordinates. Dispatched on the top tab
+  // session; Chrome routes the event into whichever (OOP)iframe is under it.
   d.register("page.clickXy", async (raw) => {
     const p = PageClickXyParamsSchema.parse(raw);
-    const btn = p.button === "right" ? 2 : p.button === "middle" ? 1 : 0;
-    const btnName = p.button === "right" ? "right" : p.button === "middle" ? "middle" : "left";
-    for (let i = 1; i <= p.clickCount; i++) {
-      await mgr.sendCommand(p.tabId, "Input.dispatchMouseEvent", {
-        type: "mousePressed", x: p.x, y: p.y, button: btnName, buttons: 1 << btn, clickCount: i,
-      });
-      await mgr.sendCommand(p.tabId, "Input.dispatchMouseEvent", {
-        type: "mouseReleased", x: p.x, y: p.y, button: btnName, buttons: 0, clickCount: i,
-      });
-    }
+    const pt = toCssPoint(p.tabId, p.x, p.y, p.space);
+    const baseline = p.settle ? await popupBaseline(mgr, p.tabId, await focusedKeyboardTarget(mgr, p.tabId)) : undefined;
+    await mouseClickAt(mgr, p.tabId, pt.x, pt.y, p.button, p.clickCount);
+    const focus = p.settle ? await settleFocus(mgr, p.tabId, {}, baseline) : undefined;
     const snapshot = await maybeSnapshot(mgr, p.tabId, p.includeSnapshot);
-    return { ok: true as const, snapshot };
+    return { ok: true as const, point: { x: pt.x, y: pt.y }, spaceUsed: pt.spaceUsed, focus, snapshot };
   });
 
   d.register("page.type", async (raw) => {
     const p = PageTypeParamsSchema.parse(raw);
+    const mac = await isMacBrowser();
+    const mods = modifierFlags(p.modifiers, mac);
+    // Field-level fidelity checks only make sense for plain text typed into ONE
+    // field: Tab/Enter move focus, chords aren't text.
+    const singleField = !/[\t\r\n]/.test(p.text) && (mods & ~MOD_SHIFT) === 0 && p.text.length > 0;
+    const checkExact = p.exact && p.settle && singleField;
 
     // No-target path: no uid, no selector → dispatch keystrokes at the current
-    // focus without resolving or focusing any element. Mirrors Claude in
-    // Chrome's `type` action and is the canonical primitive for typing into
-    // a virtual-canvas cell after page_click_xy lands focus there.
+    // focus without resolving or focusing any element. The canonical
+    // primitive for typing into a canvas-like widget after a click.
     if (!p.uid && !p.selector) {
+      let targetId: string | undefined;
+      let before: string | null = null;
+      let baseline: PopupBaseline | undefined;
       try {
-        const targetId = await focusedKeyboardTarget(mgr, p.tabId);
+        targetId = await focusedKeyboardTarget(mgr, p.tabId);
         if (p.requireEmpty) await assertEmptyFocusTarget(mgr, p.tabId, targetId);
-        const mods = modifierFlags(p.modifiers);
+        if (checkExact) before = await fieldReader(mgr, p.tabId, undefined, targetId)();
+        if (p.settle) baseline = await popupBaseline(mgr, p.tabId, targetId);
         for (const ch of p.text) {
-          await dispatchKey(mgr, p.tabId, charToKeyDef(ch), mods, targetId);
+          await dispatchKey(mgr, p.tabId, charToKeyDef(ch), mods, targetId, mac);
         }
       } catch (e) {
         throw translateCdpError(e);
       }
+      let focus = p.settle ? await settleFocus(mgr, p.tabId, {}, baseline) : undefined;
+      const completion = checkExact && before === ""
+        ? await dropInlineCompletion(mgr, p.tabId, p.text, fieldReader(mgr, p.tabId, undefined, targetId), targetId, mac)
+        : undefined;
+      if (completion) focus = await settleFocus(mgr, p.tabId, {}, baseline);
       const snapshot = await maybeSnapshot(mgr, p.tabId, p.includeSnapshot);
-      return { ok: true as const, snapshot };
+      return { ok: true as const, ...(completion ? { completion } : {}), focus, snapshot };
     }
 
-    let el;
+    let el: ResolvedElement;
     try {
       el = await resolveElement(mgr, p.tabId, p.uid, p.selector);
     } catch (e) {
@@ -780,10 +780,9 @@ export function registerPageInteractHandlers(d: Dispatcher, mgr: DebuggerManager
 
     // Self-verifying focus: JS focus → verify → escalate to coordinate-click
     // on mismatch → verify again. If both attempts fail we throw a structured
-    // error including what activeElement actually became, so the caller can
-    // route to page.focus or app-specific anchors instead of typing into
-    // the void. Cross-extension iframes (1Password etc.) keep their own
-    // coordinate-click fallback path because Chrome refuses JS access there.
+    // error including what activeElement actually became. Cross-extension
+    // iframes (1Password etc.) keep their own coordinate-click fallback
+    // because Chrome refuses JS access there.
     let usedFallback = false;
     let outcome: FocusOutcome;
     try {
@@ -802,39 +801,52 @@ export function registerPageInteractHandlers(d: Dispatcher, mgr: DebuggerManager
       const a = outcome.actual!;
       throw new Error(
         `page.type couldn't focus the target — activeElement is <${a.actualTag} role="${a.actualRole ?? ""}" name="${a.actualName ?? ""}">. ` +
-        `The page is grabbing focus elsewhere (common in Excel/Sheets/Figma). ` +
+        `The page is grabbing focus elsewhere. ` +
         `Try page.focus(uid, mode: "blur+click") or use an app-specific anchor.`,
       );
     }
 
     if (p.requireEmpty) await assertEmptyFocusTarget(mgr, p.tabId, el.targetId);
 
+    // Clear through real input (select contents + Backspace, verified). In
+    // the cross-extension fallback we can't inspect the field, so we skip
+    // clearing rather than fire blind key combos — login fields start empty.
     if (p.clear && !usedFallback) {
-      await mgr.sendCommand(p.tabId, "Runtime.callFunctionOn", {
-        objectId: el.objectId,
-        functionDeclaration: `function() {
-          if ('value' in this) { this.value = ''; this.dispatchEvent(new Event('input', {bubbles:true})); }
-          else if (this.isContentEditable) { this.textContent = ''; }
-        }`,
-        returnByValue: true,
-      }, el.targetId).catch((e) => { if (!isCrossExtensionError(e)) throw translateCdpError(e); });
+      let cleared: { outcome: ClearOutcome; remaining?: string };
+      try {
+        cleared = await clearField(mgr, p.tabId, el, mac);
+      } catch (e) {
+        if (!isCrossExtensionError(e)) throw translateCdpError(e);
+        cleared = { outcome: "not-editable" };
+      }
+      if (cleared.outcome === "failed") {
+        throw new Error(
+          `page.type couldn't clear the field — it still contains "${(cleared.remaining ?? "").slice(0, 120)}". ` +
+          `Nothing was typed. Pass clear:false to append instead, or clear it another way first.`,
+        );
+      }
     }
-    // In fallback mode we can't read the field; a Ctrl/Cmd+A + Delete keyboard
-    // sequence would clear but is platform-dependent — we skip clear rather
-    // than risk firing the wrong key combo. Most login fields are empty anyway.
 
-    // Type as real keystrokes (keyDown + keyUp per char) via CDP.
-    // Input.insertText would be faster but it bypasses the keyboard event
-    // pipeline that some apps (Office365 / Excel for the Web, Google Sheets,
-    // Figma, anything with custom input handling) rely on to commit values.
-    // Real keystrokes work in both standard inputs and these custom surfaces.
+    const read = fieldReader(mgr, p.tabId, el, el.targetId);
+    const before = checkExact && !usedFallback ? await read() : null;
+    const baseline = p.settle ? await popupBaseline(mgr, p.tabId, el.targetId) : undefined;
+
+    // Real keystrokes (keyDown + keyUp per char). Input.insertText would be
+    // faster but bypasses the keyboard pipeline that rich editors rely on to
+    // commit values.
     try {
       for (const ch of p.text) {
-        await dispatchKey(mgr, p.tabId, charToKeyDef(ch), modifierFlags(p.modifiers), el.targetId);
+        await dispatchKey(mgr, p.tabId, charToKeyDef(ch), mods, el.targetId, mac);
       }
     } catch (e) {
       throw translateCdpError(e);
     }
+
+    let focus = p.settle ? await settleFocus(mgr, p.tabId, {}, baseline) : undefined;
+    const completion = before === ""
+      ? await dropInlineCompletion(mgr, p.tabId, p.text, read, el.targetId, mac)
+      : undefined;
+    if (completion) focus = await settleFocus(mgr, p.tabId, {}, baseline);
 
     if (p.submit && !usedFallback) {
       await mgr.sendCommand(p.tabId, "Runtime.callFunctionOn", {
@@ -845,13 +857,21 @@ export function registerPageInteractHandlers(d: Dispatcher, mgr: DebuggerManager
     }
 
     const snapshot = await maybeSnapshot(mgr, p.tabId, p.includeSnapshot);
-    return { ok: true as const, snapshot };
+    return { ok: true as const, ...(completion ? { completion } : {}), focus, snapshot };
   });
 
+  /**
+   * page.paste: put text on the clipboard and press the platform paste
+   * shortcut — ⌘V on macOS, Ctrl+V on Windows / Linux / ChromeOS — exactly as
+   * a person would. On macOS the key event carries the "paste" editing
+   * command; without it Chrome delivers a bare keydown and nothing is pasted.
+   * Success is VERIFIED: a one-shot probe in the focused frame must observe a
+   * trusted paste event, otherwise we throw instead of reporting a phantom ok.
+   */
   d.register("page.paste", async (raw) => {
     const p = PagePasteParamsSchema.parse(raw);
+    const mac = await isMacBrowser();
 
-    // 1. Set focus on the desired target (current / uid / xy).
     let el: ResolvedElement | undefined;
     if (p.target === "uid") {
       el = await resolveElement(mgr, p.tabId, p.uid, p.selector);
@@ -863,61 +883,66 @@ export function registerPageInteractHandlers(d: Dispatcher, mgr: DebuggerManager
         );
       }
     } else if (p.target === "xy") {
-      await mgr.sendCommand(p.tabId, "Input.dispatchMouseEvent", {
-        type: "mousePressed", x: p.x!, y: p.y!, button: "left", buttons: 1, clickCount: 1,
-      });
-      await mgr.sendCommand(p.tabId, "Input.dispatchMouseEvent", {
-        type: "mouseReleased", x: p.x!, y: p.y!, button: "left", buttons: 0, clickCount: 1,
-      });
+      const pt = toCssPoint(p.tabId, p.x!, p.y!, p.space);
+      await mouseClickAt(mgr, p.tabId, pt.x, pt.y, "left", 1);
+      // Let the app move its selection/focus before we look for the focused frame.
+      await sleep(120);
     }
-    // For target=current we paste wherever document.activeElement currently is.
 
-    const targetId = el?.targetId;
-
-    // 2. Write text to the clipboard. navigator.clipboard.writeText needs a
-    //    transient user activation, which a prior coordinate-click provides;
-    //    fall back to the legacy execCommand path otherwise.
+    const targetId = el?.targetId ?? (await focusedKeyboardTarget(mgr, p.tabId));
+    const baseline = p.settle ? await popupBaseline(mgr, p.tabId, targetId) : undefined;
+    await evalIn(mgr, p.tabId, targetId, ARM_PASTE_PROBE);
     try {
-      const r = await mgr.sendCommand<{ result: { value?: boolean } }>(p.tabId, "Runtime.evaluate", {
-        expression: `(async () => {
-          try { await navigator.clipboard.writeText(${JSON.stringify(p.text)}); return true; }
-          catch (e) { return false; }
-        })()`,
+      const via = await evalIn<string>(mgr, p.tabId, targetId, writeClipboardExpr(p.text), {
         awaitPromise: true,
-        returnByValue: true,
-      }, targetId);
-      if (r.result.value !== true) throw new Error("clipboard API refused");
-    } catch {
-      await mgr.sendCommand(p.tabId, "Runtime.evaluate", {
-        expression: `(function(t){
-          const ta = document.createElement('textarea');
-          ta.value = t; ta.style.position='fixed'; ta.style.opacity='0';
-          document.body.appendChild(ta); ta.focus(); ta.select();
-          try { document.execCommand('copy'); } finally { ta.remove(); }
-        })(${JSON.stringify(p.text)})`,
-        returnByValue: true,
-      }, targetId);
+        userGesture: true,
+      });
+      if (via !== "clipboard-api" && via !== "copy-event") {
+        throw new Error(
+          "page.paste couldn't write to the clipboard (the focused document refused both the Clipboard API and the copy command). " +
+          "Make sure the tab's window is not minimized and focus is inside the page.",
+        );
+      }
+
+      await dispatchKey(mgr, p.tabId, { key: "v", code: "KeyV", keyCode: 86 }, shortcutModifier(mac), targetId, mac);
+
+      let probe: { fired: boolean; prevented: boolean | null; target: string | null } | null | undefined;
+      const deadline = Date.now() + 1_500;
+      for (;;) {
+        probe = await evalIn(mgr, p.tabId, targetId, READ_PASTE_PROBE);
+        if (probe?.fired && probe.prevented !== null) break;
+        if (Date.now() >= deadline) break;
+        await sleep(40);
+      }
+      if (!probe?.fired) {
+        const st = await readFocusState(mgr, p.tabId, targetId).catch(() => undefined);
+        const where = st ? `<${st.activeTag}${st.activeRole ? ` role="${st.activeRole}"` : ""}${st.activeName ? ` name="${st.activeName.slice(0, 60)}"` : ""}>` : "the focused element";
+        throw new Error(
+          `page.paste: the ${mac ? "⌘V" : "Ctrl+V"} keystroke was delivered but no paste event reached ${where} — nothing was pasted. ` +
+          `Focus a cell/field that accepts paste first (page_focus_state shows where focus is). The text is still on the clipboard.`,
+        );
+      }
+
+      const focus = p.settle ? await settleFocus(mgr, p.tabId, {}, baseline) : undefined;
+      const snapshot = await maybeSnapshot(mgr, p.tabId, p.includeSnapshot);
+      return {
+        ok: true as const,
+        bytesWritten: p.text.length,
+        pasteDelivered: true,
+        ...(typeof probe.prevented === "boolean" ? { pasteHandledByPage: probe.prevented } : {}),
+        focus,
+        snapshot,
+      };
+    } finally {
+      await evalIn(mgr, p.tabId, targetId, DISPOSE_PASTE_PROBE).catch(() => undefined);
     }
-
-    // 3. Dispatch Cmd+V on macOS, Ctrl+V elsewhere. modifier flag 4 = Meta, 2 = Control.
-    const plat = await mgr.sendCommand<{ result: { value: string } }>(p.tabId, "Runtime.evaluate", {
-      expression: "navigator.platform || ''",
-      returnByValue: true,
-    });
-    const isMac = /Mac|iPhone|iPad/.test(plat.result.value);
-    const modifiers = isMac ? 4 : 2;
-    // No `text` field — modifiers are non-zero, so we don't want a literal "v" inserted.
-    await dispatchKey(mgr, p.tabId, { key: "v", code: "KeyV", keyCode: 86 }, modifiers, targetId);
-
-    const snapshot = await maybeSnapshot(mgr, p.tabId, p.includeSnapshot);
-    return { ok: true as const, bytesWritten: p.text.length, snapshot };
   });
 
   d.register("page.scroll", async (raw) => {
     const p = PageScrollParamsSchema.parse(raw);
 
     if (p.mode === "wheel") {
-      // Real wheel event so virtualized grids (Excel canvas) lazy-load rows.
+      // Real wheel event so virtualized grids/canvases lazy-load rows.
       // Anchor the cursor at the uid/selector centre when given, else viewport centre.
       let x: number;
       let y: number;
@@ -936,6 +961,10 @@ export function registerPageInteractHandlers(d: Dispatcher, mgr: DebuggerManager
         x = Math.floor((vp as { w: number }).w / 2);
         y = Math.floor((vp as { h: number }).h / 2);
       }
+      // Hover first: wheel handlers of some grids only engage once the pointer is over them.
+      await mgr.sendCommand(p.tabId, "Input.dispatchMouseEvent", {
+        type: "mouseMoved", x, y, button: "none", buttons: 0,
+      }, targetId);
       await mgr.sendCommand(p.tabId, "Input.dispatchMouseEvent", {
         type: "mouseWheel", x, y, deltaX: p.dx ?? 0, deltaY: p.dy ?? 0,
       }, targetId);
@@ -1010,9 +1039,13 @@ export function registerPageInteractHandlers(d: Dispatcher, mgr: DebuggerManager
 
   d.register("page.pressKey", async (raw) => {
     const p = PagePressKeyParamsSchema.parse(raw);
-    await dispatchKeyAtCurrentFocus(mgr, p.tabId, resolveKey(p.key), modifierFlags(p.modifiers));
+    const mac = await isMacBrowser();
+    const targetId = await focusedKeyboardTarget(mgr, p.tabId);
+    const baseline = p.settle ? await popupBaseline(mgr, p.tabId, targetId) : undefined;
+    await dispatchKey(mgr, p.tabId, resolveKey(p.key), modifierFlags(p.modifiers, mac), targetId, mac);
+    const focus = p.settle ? await settleFocus(mgr, p.tabId, {}, baseline) : undefined;
     const snapshot = await maybeSnapshot(mgr, p.tabId, p.includeSnapshot);
-    return { ok: true as const, snapshot };
+    return { ok: true as const, focus, snapshot };
   });
 
   d.register("page.focusState", async (raw) => {
@@ -1022,24 +1055,22 @@ export function registerPageInteractHandlers(d: Dispatcher, mgr: DebuggerManager
 
   d.register("page.fillForm", async (raw) => {
     const p = PageFillFormParamsSchema.parse(raw);
+    const mac = await isMacBrowser();
     let filled = 0;
     for (const field of p.fields) {
       const el = await resolveElement(mgr, p.tabId, field.uid, field.selector);
-      // Focus + clear via JS; fall back to coordinate click when blocked by another extension.
-      let usedFallback = false;
+      // Focus + clear through real input; fall back to a coordinate click when
+      // another extension's iframe blocks JS access (we then skip clearing).
       try {
-        await mgr.sendCommand(p.tabId, "Runtime.callFunctionOn", {
-          objectId: el.objectId,
-          functionDeclaration: `function() {
-            this.focus();
-            if ('value' in this) { this.value = ''; this.dispatchEvent(new Event('input', {bubbles:true})); }
-            else if (this.isContentEditable) { this.textContent = ''; }
-          }`,
-          returnByValue: true,
-        }, el.targetId);
+        await jsFocus(mgr, p.tabId, el);
+        const cleared = await clearField(mgr, p.tabId, el, mac);
+        if (cleared.outcome === "failed") {
+          throw new Error(
+            `page.fillForm couldn't clear field ${field.uid ?? field.selector} — it still contains "${(cleared.remaining ?? "").slice(0, 120)}".`,
+          );
+        }
       } catch (e) {
         if (!isCrossExtensionError(e)) throw translateCdpError(e);
-        usedFallback = true;
         try {
           await coordinateClick(mgr, p.tabId, el.objectId, el.targetId);
         } catch (ce) {
@@ -1048,14 +1079,12 @@ export function registerPageInteractHandlers(d: Dispatcher, mgr: DebuggerManager
       }
       try {
         for (const ch of field.value) {
-          await dispatchKey(mgr, p.tabId, charToKeyDef(ch), 0, el.targetId);
+          await dispatchKey(mgr, p.tabId, charToKeyDef(ch), 0, el.targetId, mac);
         }
       } catch (e) {
         throw translateCdpError(e);
       }
       filled++;
-      // Nudge the cached usedFallback so tsc knows it's observed.
-      void usedFallback;
     }
     if (p.submit) {
       const lastField = p.fields[p.fields.length - 1];

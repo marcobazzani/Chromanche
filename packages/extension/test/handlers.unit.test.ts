@@ -15,6 +15,7 @@ const _chromeStub = vi.hoisted(() => {
 
 import { registerHandlers } from "../src/handlers/index.js";
 import { Dispatcher } from "../src/dispatcher.js";
+import { resetScreenshotTransforms } from "../src/lib/screenshot-transform.js";
 
 function fakeChrome() {
   const state = {
@@ -32,8 +33,30 @@ function fakeChrome() {
       textPresent: true as boolean,
       // page.snapshot since=last: add an extra a11y node on demand.
       extraAxNode: false as boolean,
+      // page.type clear handshake: element kind and what remains after clearing.
+      // Default "empty" → nothing to clear, so keystroke-count tests stay exact.
+      clearKind: "empty" as string,
+      textAfterClear: "" as string,
+      // page.paste probe readout (what the in-page paste observer saw).
+      pasteProbe: { fired: true, prevented: true, target: "div" } as Record<string, unknown> | null,
+      clipboardVia: "clipboard-api" as string,
+      // Page.getLayoutMetrics css viewport + Page.captureScreenshot behaviour.
+      cssViewport: { pageX: 0, pageY: 0, clientWidth: 1280, clientHeight: 720 } as Record<string, number>,
+      captureFails: false as boolean,
+      // location.href per session (undefined targetId = top frame).
+      frameUrls: {} as Record<string, string>,
+      // Field text reads (successive values; the last one repeats): focused
+      // element via Runtime.evaluate, resolved element via callFunctionOn.
+      fieldTexts: [] as string[],
+      elementFieldTexts: [] as string[],
+      // Popups reported by the focus-state probe before/after any key event.
+      keysSent: false as boolean,
+      popupsBeforeKeys: [] as Array<Record<string, unknown>>,
+      popupsAfterKeys: [] as Array<Record<string, unknown>>,
+      expandedAfterKeys: null as string | null,
     },
   };
+  const nextText = (list: string[]) => (list.length > 1 ? list.shift()! : list[0]);
   (globalThis as any).chrome = {
     tabs: {
       query: vi.fn(async (q: { active?: boolean; lastFocusedWindow?: boolean }) => {
@@ -98,10 +121,30 @@ function fakeChrome() {
       }),
       sendCommand: vi.fn(async (target: any, method: string, params: any) => {
         state.debuggerState.commands.push({ target, method, params });
+        if (method === "Input.dispatchKeyEvent") state.debuggerState.keysSent = true;
         if (method === "Runtime.enable" || method === "Network.enable" || method === "Accessibility.enable" || method === "Page.enable") return {};
         if (method === "Runtime.evaluate") {
           if (params?.expression === "document.hasFocus()") {
             return { result: { type: "boolean", value: target.targetId === state.debuggerState.focusedTargetId } };
+          }
+          // page.type exact-typing check: text of the focused field.
+          if (typeof params?.expression === "string" && params.expression.includes("isContentEditable") &&
+              params.expression.includes("document.activeElement")) {
+            const v = nextText(state.debuggerState.fieldTexts);
+            return v === undefined ? { result: { type: "undefined" } } : { result: { type: "string", value: v } };
+          }
+          if (params?.expression === "location.href") {
+            const url = state.debuggerState.frameUrls[target.targetId ?? "top"] ?? (target.targetId ? "https://grid.example/" : "https://a/");
+            return { result: { type: "string", value: url } };
+          }
+          // page.paste: probe arm / read / dispose, then the clipboard write.
+          if (typeof params?.expression === "string" && params.expression.includes("__chromanchePasteProbe")) {
+            if (params.expression.includes("addEventListener")) return { result: { type: "boolean", value: true } };
+            if (params.expression.includes("dispose()")) return { result: { type: "boolean", value: true } };
+            return { result: { type: "object", value: state.debuggerState.pasteProbe } };
+          }
+          if (typeof params?.expression === "string" && params.expression.includes("navigator.clipboard")) {
+            return { result: { type: "string", value: state.debuggerState.clipboardVia } };
           }
           // page.wait text mode: an innerText.includes(...) probe. Honor a
           // per-test override so we can simulate text present/absent.
@@ -132,6 +175,8 @@ function fakeChrome() {
                   activeDescendantBounds: { x: 120, y: 240, width: 80, height: 24 },
                   ariaRowIndex: "3",
                   ariaColIndex: "2",
+                  activeExpanded: state.debuggerState.keysSent ? state.debuggerState.expandedAfterKeys : null,
+                  popups: state.debuggerState.keysSent ? state.debuggerState.popupsAfterKeys : state.debuggerState.popupsBeforeKeys,
                 },
               },
             };
@@ -148,6 +193,21 @@ function fakeChrome() {
           if (params?.functionDeclaration?.includes("getBoundingClientRect") && params?.functionDeclaration?.includes("isConnected")) {
             return { result: { type: "object", value: state.debuggerState.actionable } };
           }
+          // page.type exact-typing check: text of the element typed into.
+          if (params?.functionDeclaration?.includes("isContentEditable") && params?.functionDeclaration?.includes("return null")) {
+            const v = nextText(state.debuggerState.elementFieldTexts);
+            return v === undefined ? { result: { type: "undefined" } } : { result: { type: "string", value: v } };
+          }
+          // page.type clear handshake (kind detection → selection coverage → remaining text).
+          if (params?.functionDeclaration?.includes("isContentEditable")) {
+            return { result: { type: "string", value: state.debuggerState.clearKind } };
+          }
+          if (params?.functionDeclaration?.includes("selectionStart === 0")) {
+            return { result: { type: "boolean", value: true } };
+          }
+          if (params?.functionDeclaration?.includes("String(this.value")) {
+            return { result: { type: "string", value: state.debuggerState.textAfterClear } };
+          }
           // verifyFocus: JS in the page returns { matches, actualTag?, ... }.
           // Default to "focus took" so happy-path tests don't have to special-case it.
           if (params?.functionDeclaration?.includes("doc.activeElement") || params?.functionDeclaration?.includes("matches: true")) {
@@ -156,6 +216,11 @@ function fakeChrome() {
           return { result: { type: "undefined" } };
         }
         if (method === "Page.handleJavaScriptDialog") return {};
+        if (method === "Page.getLayoutMetrics") return { cssVisualViewport: state.debuggerState.cssViewport };
+        if (method === "Page.captureScreenshot") {
+          if (state.debuggerState.captureFails) throw new Error("Unable to capture screenshot");
+          return { data: "BBBB" };
+        }
         if (method === "DOM.setFileInputFiles") return {};
         if (method === "Accessibility.getFullAXTree") {
           return {
@@ -214,6 +279,7 @@ describe("handlers", () => {
 
   beforeEach(() => {
     state = fakeChrome();
+    resetScreenshotTransforms();
     d = new Dispatcher();
     registerHandlers(d);
   });
@@ -323,10 +389,11 @@ describe("handlers", () => {
     expect(r.content).not.toContain("Submit");
   });
 
-  it("page.screenshot strips the data URL prefix and returns base64", async () => {
+  it("page.screenshot captures THIS tab via CDP and returns base64 + viewport metadata", async () => {
     const resp = await d.handle({ jsonrpc: "2.0", id: 22, method: "page.screenshot", params: { tabId: 1 } });
-    expect((resp.result as any).base64).toBe("AAAA");
+    expect((resp.result as any).base64).toBe("BBBB");
     expect((resp.result as any).format).toBe("jpeg");
+    expect((resp.result as any).capture).toBe("cdp");
     expect((resp.result as any).viewport).toEqual({
       width: 1280,
       height: 720,
@@ -334,6 +401,50 @@ describe("handlers", () => {
       scrollX: 10,
       scrollY: 20,
     });
+    // Not chrome.tabs.captureVisibleTab — that grabs whichever tab is visible in the window.
+    expect((globalThis as any).chrome.tabs.captureVisibleTab).not.toHaveBeenCalled();
+  });
+
+  it("page.screenshot downscales wide viewports to fit vision limits and reports the transform", async () => {
+    state.debuggerState.cssViewport = { pageX: 0, pageY: 0, clientWidth: 2560, clientHeight: 1143 };
+    state.debuggerState.commands = [];
+    const resp = await d.handle({ jsonrpc: "2.0", id: 27, method: "page.screenshot", params: { tabId: 1 } });
+    const r = resp.result as any;
+    const cap = state.debuggerState.commands.find((c: any) => c.method === "Page.captureScreenshot");
+    // Long edge 2560 → 1568 (default maxEdge): scale 0.6125, also under 1.15 MP.
+    expect(cap.params.clip).toMatchObject({ x: 0, y: 0, width: 2560, height: 1143 });
+    expect(cap.params.clip.scale).toBeCloseTo(1568 / 2560, 5);
+    expect(r.image).toEqual({ width: 1568, height: 700 });
+    expect(r.scale).toBeCloseTo(2560 / 1568, 3);
+    expect(r.origin).toEqual({ x: 0, y: 0 });
+  });
+
+  it("page.screenshot clip is captured in document coordinates (adds the scroll offset)", async () => {
+    state.debuggerState.cssViewport = { pageX: 0, pageY: 900, clientWidth: 1000, clientHeight: 600 };
+    state.debuggerState.commands = [];
+    const resp = await d.handle({
+      jsonrpc: "2.0", id: 28, method: "page.screenshot",
+      params: { tabId: 1, clip: { x: 100, y: 50, width: 400, height: 200 } },
+    });
+    const cap = state.debuggerState.commands.find((c: any) => c.method === "Page.captureScreenshot");
+    expect(cap.params.clip).toMatchObject({ x: 100, y: 950, width: 400, height: 200, scale: 1 });
+    expect((resp.result as any).origin).toEqual({ x: 100, y: 50 });
+  });
+
+  it("page.screenshot refuses to return another tab's pixels when a background tab can't render", async () => {
+    state.tabs[0].active = false;
+    state.debuggerState.captureFails = true;
+    const resp = await d.handle({ jsonrpc: "2.0", id: 29, method: "page.screenshot", params: { tabId: 1 } });
+    expect(resp.error?.message).toMatch(/background/);
+    expect(resp.error?.message).toMatch(/tabs_activate/);
+    expect((globalThis as any).chrome.tabs.captureVisibleTab).not.toHaveBeenCalled();
+  });
+
+  it("page.screenshot falls back to the visible-tab capture only when this tab IS the visible one", async () => {
+    state.debuggerState.captureFails = true;
+    const resp = await d.handle({ jsonrpc: "2.0", id: 30, method: "page.screenshot", params: { tabId: 1 } });
+    expect((resp.result as any).base64).toBe("AAAA");
+    expect((resp.result as any).capture).toBe("visibleTab");
   });
 
   it("page.snapshot with no tabId resolves to the active tab", async () => {
@@ -383,7 +494,7 @@ describe("handlers", () => {
   // page.clickXy: vision-driven escape hatch. Dispatches at the supplied
   // (x, y) without resolving any element — used after the model has read a
   // screenshot and computed coordinates for a virtual-canvas widget cell.
-  it("page.clickXy fires mousePressed + mouseReleased at exact coordinates", async () => {
+  it("page.clickXy hovers, then fires mousePressed + mouseReleased at exact coordinates", async () => {
     state.debuggerState.commands = [];
     const resp = await d.handle({
       jsonrpc: "2.0", id: 200, method: "page.clickXy",
@@ -391,19 +502,24 @@ describe("handlers", () => {
     });
     expect((resp.result as any).ok).toBe(true);
     const mouse = state.debuggerState.commands.filter((c: any) => c.method === "Input.dispatchMouseEvent");
-    expect(mouse.length).toBe(2);
-    expect(mouse[0].params).toMatchObject({ type: "mousePressed", x: 45, y: 107, button: "left" });
-    expect(mouse[1].params).toMatchObject({ type: "mouseReleased", x: 45, y: 107, button: "left" });
+    expect(mouse.map((m: any) => m.params.type)).toEqual(["mouseMoved", "mousePressed", "mouseReleased"]);
+    expect(mouse[1].params).toMatchObject({ type: "mousePressed", x: 45, y: 107, button: "left", buttons: 1 });
+    expect(mouse[2].params).toMatchObject({ type: "mouseReleased", x: 45, y: 107, button: "left" });
+    // No screenshot yet for this tab → coordinates were taken as CSS px.
+    expect((resp.result as any).spaceUsed).toBe("css");
   });
 
-  it("page.clickXy honors button=right and never resolves a uid (no DOM lookup)", async () => {
+  it("page.clickXy honors button=right (buttons bitmask 2) and never resolves a uid (no DOM lookup)", async () => {
     state.debuggerState.commands = [];
     await d.handle({
       jsonrpc: "2.0", id: 201, method: "page.clickXy",
       params: { tabId: 1, x: 200, y: 50, button: "right" },
     });
-    const mouse = state.debuggerState.commands.filter((c: any) => c.method === "Input.dispatchMouseEvent");
-    expect(mouse[0].params.button).toBe("right");
+    const pressed = state.debuggerState.commands.find(
+      (c: any) => c.method === "Input.dispatchMouseEvent" && c.params.type === "mousePressed",
+    );
+    expect(pressed.params.button).toBe("right");
+    expect(pressed.params.buttons).toBe(2);
     // Critical: no DOM.resolveNode / DOM.getBoxModel — clickXy bypasses element resolution.
     const dom = state.debuggerState.commands.filter((c: any) => /^DOM\./.test(c.method));
     expect(dom.length).toBe(0);
@@ -415,10 +531,65 @@ describe("handlers", () => {
       jsonrpc: "2.0", id: 202, method: "page.clickXy",
       params: { tabId: 1, x: 88, y: 144, clickCount: 2 },
     });
-    const mouse = state.debuggerState.commands.filter((c: any) => c.method === "Input.dispatchMouseEvent");
-    expect(mouse.length).toBe(4);
-    expect(mouse.map((c: any) => c.params.clickCount)).toEqual([1, 1, 2, 2]);
-    expect(mouse.every((c: any) => c.params.x === 88 && c.params.y === 144)).toBe(true);
+    const clicks = state.debuggerState.commands.filter(
+      (c: any) => c.method === "Input.dispatchMouseEvent" && c.params.type !== "mouseMoved",
+    );
+    expect(clicks.length).toBe(4);
+    expect(clicks.map((c: any) => c.params.clickCount)).toEqual([1, 1, 2, 2]);
+    expect(clicks.every((c: any) => c.params.x === 88 && c.params.y === 144)).toBe(true);
+  });
+
+  it("page.clickXy maps screenshot pixels back to CSS px using the last screenshot's transform", async () => {
+    // 2560px-wide viewport → screenshot downscaled to 1568px (scale 2560/1568).
+    state.debuggerState.cssViewport = { pageX: 0, pageY: 0, clientWidth: 2560, clientHeight: 1143 };
+    await d.handle({ jsonrpc: "2.0", id: 203, method: "page.screenshot", params: { tabId: 1 } });
+    state.debuggerState.commands = [];
+    const resp = await d.handle({
+      jsonrpc: "2.0", id: 204, method: "page.clickXy",
+      params: { tabId: 1, x: 158, y: 184 },
+    });
+    const pressed = state.debuggerState.commands.find(
+      (c: any) => c.method === "Input.dispatchMouseEvent" && c.params.type === "mousePressed",
+    );
+    const s = 2560 / 1568;
+    expect(pressed.params.x).toBeCloseTo(158 * s, 1);
+    expect(pressed.params.y).toBeCloseTo(184 * s, 1);
+    expect((resp.result as any).spaceUsed).toBe("screenshot");
+    expect((resp.result as any).point.x).toBeCloseTo(158 * s, 1);
+  });
+
+  it("page.clickXy space=css bypasses the screenshot transform", async () => {
+    state.debuggerState.cssViewport = { pageX: 0, pageY: 0, clientWidth: 2560, clientHeight: 1143 };
+    await d.handle({ jsonrpc: "2.0", id: 205, method: "page.screenshot", params: { tabId: 1 } });
+    state.debuggerState.commands = [];
+    await d.handle({
+      jsonrpc: "2.0", id: 206, method: "page.clickXy",
+      params: { tabId: 1, x: 2000, y: 900, space: "css" },
+    });
+    const pressed = state.debuggerState.commands.find(
+      (c: any) => c.method === "Input.dispatchMouseEvent" && c.params.type === "mousePressed",
+    );
+    expect(pressed.params).toMatchObject({ x: 2000, y: 900 });
+  });
+
+  it("page.clickXy rejects screenshot coordinates outside the last image (likely CSS px)", async () => {
+    state.debuggerState.cssViewport = { pageX: 0, pageY: 0, clientWidth: 2560, clientHeight: 1143 };
+    await d.handle({ jsonrpc: "2.0", id: 207, method: "page.screenshot", params: { tabId: 1 } });
+    const resp = await d.handle({
+      jsonrpc: "2.0", id: 208, method: "page.clickXy",
+      params: { tabId: 1, x: 2000, y: 900 },
+    });
+    expect(resp.error?.message).toMatch(/outside the last screenshot/);
+    expect(resp.error?.message).toMatch(/space:"css"/);
+  });
+
+  it("page.clickXy reports where focus settled afterwards", async () => {
+    const resp = await d.handle({
+      jsonrpc: "2.0", id: 209, method: "page.clickXy",
+      params: { tabId: 1, x: 10, y: 10 },
+    });
+    const focus = (resp.result as any).focus;
+    expect(focus).toMatchObject({ tag: "div", role: "gridcell", activeDescendantName: "B3", settled: true });
   });
 
   // --- page.type (CDP-based) ---
@@ -1110,7 +1281,7 @@ describe("handlers", () => {
   });
 
   // --- page.paste ---
-  it("page.paste writes to clipboard and dispatches a paste key with a modifier", async () => {
+  it("page.paste on Windows/Linux sends Ctrl+V without macOS editing commands and verifies delivery", async () => {
     state.debuggerState.commands = [];
     const resp = await d.handle({
       jsonrpc: "2.0", id: 330, method: "page.paste",
@@ -1118,17 +1289,305 @@ describe("handlers", () => {
     });
     expect((resp.result as any).ok).toBe(true);
     expect((resp.result as any).bytesWritten).toBe("Alice\t30\nBob\t25".length);
+    expect((resp.result as any).pasteDelivered).toBe(true);
+    expect((resp.result as any).pasteHandledByPage).toBe(true);
     const clip = state.debuggerState.commands.filter(
       (c: any) => c.method === "Runtime.evaluate" &&
         typeof c.params?.expression === "string" &&
         c.params.expression.includes("clipboard"),
     );
     expect(clip.length).toBeGreaterThan(0);
+    // Clipboard write runs with a user gesture so the async Clipboard API / copy command is allowed.
+    expect(clip.some((c: any) => c.params.userGesture === true)).toBe(true);
     const vKeys = state.debuggerState.commands.filter(
       (c: any) => c.method === "Input.dispatchKeyEvent" && c.params.code === "KeyV",
     );
     expect(vKeys.length).toBe(2); // keyDown + keyUp
-    expect(vKeys[0].params.modifiers).toBeGreaterThan(0);
+    expect(vKeys[0].params.modifiers).toBe(2); // Control
+    expect(vKeys[0].params.commands).toBeUndefined();
+    expect(vKeys[0].params.text).toBeUndefined(); // a chord, not a "v"
+  });
+
+  it("page.paste on macOS sends Cmd+V carrying the Blink 'paste' editing command", async () => {
+    (globalThis as any).chrome.runtime = { getPlatformInfo: vi.fn(async () => ({ os: "mac" })) };
+    state.debuggerState.commands = [];
+    const resp = await d.handle({
+      jsonrpc: "2.0", id: 331, method: "page.paste",
+      params: { tabId: 1, text: "x\ty" },
+    });
+    expect((resp.result as any).ok).toBe(true);
+    const down = state.debuggerState.commands.find(
+      (c: any) => c.method === "Input.dispatchKeyEvent" && c.params.code === "KeyV" && c.params.type === "keyDown",
+    );
+    expect(down.params.modifiers).toBe(4); // Meta
+    expect(down.params.commands).toEqual(["paste"]);
+  });
+
+  it("page.paste throws instead of reporting success when no paste event reached the page", async () => {
+    state.debuggerState.pasteProbe = { fired: false, prevented: null, target: null };
+    const resp = await d.handle({
+      jsonrpc: "2.0", id: 332, method: "page.paste",
+      params: { tabId: 1, text: "nope" },
+    });
+    expect(resp.error?.message).toMatch(/no paste event reached/);
+    expect(resp.error?.message).toMatch(/Ctrl\+V/);
+  }, 10_000);
+
+  it("page.paste fails loudly when the clipboard can't be written", async () => {
+    state.debuggerState.clipboardVia = "failed";
+    const resp = await d.handle({
+      jsonrpc: "2.0", id: 333, method: "page.paste",
+      params: { tabId: 1, text: "nope" },
+    });
+    expect(resp.error?.message).toMatch(/couldn't write to the clipboard/);
+    const vKeys = state.debuggerState.commands.filter((c: any) => c.method === "Input.dispatchKeyEvent");
+    expect(vKeys.length).toBe(0);
+  });
+
+  it("page.paste arms its probe and writes the clipboard in the focused OOPIF frame", async () => {
+    await attachFocusedFrame();
+    state.debuggerState.commands = [];
+    await d.handle({ jsonrpc: "2.0", id: 334, method: "page.paste", params: { tabId: 1, text: "a\tb" } });
+    const inFrame = state.debuggerState.commands.filter(
+      (c: any) => c.method === "Runtime.evaluate" && c.target?.targetId === "grid-frame" &&
+        (c.params.expression.includes("__chromanchePasteProbe") || c.params.expression.includes("navigator.clipboard")),
+    );
+    expect(inFrame.length).toBeGreaterThanOrEqual(3); // arm, write, read (+ dispose)
+    const v = state.debuggerState.commands.find((c: any) => c.method === "Input.dispatchKeyEvent" && c.params.code === "KeyV");
+    expect(v.target).toEqual({ targetId: "grid-frame" });
+  });
+
+  it("page.paste target=xy converts screenshot coordinates before clicking", async () => {
+    state.debuggerState.cssViewport = { pageX: 0, pageY: 0, clientWidth: 2560, clientHeight: 1143 };
+    await d.handle({ jsonrpc: "2.0", id: 335, method: "page.screenshot", params: { tabId: 1 } });
+    state.debuggerState.commands = [];
+    await d.handle({ jsonrpc: "2.0", id: 336, method: "page.paste", params: { tabId: 1, text: "a", target: "xy", x: 100, y: 100 } });
+    const pressed = state.debuggerState.commands.find(
+      (c: any) => c.method === "Input.dispatchMouseEvent" && c.params.type === "mousePressed",
+    );
+    expect(pressed.params.x).toBeCloseTo(100 * (2560 / 1568), 1);
+  });
+
+  // --- multi-OS keyboard ---
+  it("page.pressKey ControlOrMeta resolves to Control on Windows/Linux", async () => {
+    (globalThis as any).chrome.runtime = { getPlatformInfo: vi.fn(async () => ({ os: "win" })) };
+    state.debuggerState.commands = [];
+    await d.handle({ jsonrpc: "2.0", id: 337, method: "page.pressKey", params: { tabId: 1, key: "a", modifiers: ["ControlOrMeta"] } });
+    const down = state.debuggerState.commands.find((c: any) => c.method === "Input.dispatchKeyEvent" && c.params.type === "keyDown");
+    expect(down.params.modifiers).toBe(2);
+    expect(down.params.commands).toBeUndefined();
+  });
+
+  it("page.pressKey ControlOrMeta resolves to Meta + selectAll command on macOS", async () => {
+    (globalThis as any).chrome.runtime = { getPlatformInfo: vi.fn(async () => ({ os: "mac" })) };
+    state.debuggerState.commands = [];
+    await d.handle({ jsonrpc: "2.0", id: 338, method: "page.pressKey", params: { tabId: 1, key: "a", modifiers: ["ControlOrMeta"] } });
+    const down = state.debuggerState.commands.find((c: any) => c.method === "Input.dispatchKeyEvent" && c.params.type === "keyDown");
+    expect(down.params.modifiers).toBe(4);
+    expect(down.params.commands).toEqual(["selectAll"]);
+    expect(down.params.text).toBeUndefined();
+  });
+
+  it("page.pressKey Meta+z on macOS carries the undo command; Shift+Meta+z carries redo", async () => {
+    (globalThis as any).chrome.runtime = { getPlatformInfo: vi.fn(async () => ({ os: "mac" })) };
+    state.debuggerState.commands = [];
+    await d.handle({ jsonrpc: "2.0", id: 339, method: "page.pressKey", params: { tabId: 1, key: "z", modifiers: ["Meta"] } });
+    await d.handle({ jsonrpc: "2.0", id: 340, method: "page.pressKey", params: { tabId: 1, key: "z", modifiers: ["Meta", "Shift"] } });
+    const downs = state.debuggerState.commands.filter((c: any) => c.method === "Input.dispatchKeyEvent" && c.params.type === "keyDown");
+    expect(downs[0].params.commands).toEqual(["undo"]);
+    expect(downs[1].params.commands).toEqual(["redo"]);
+  });
+
+  it("page.pressKey maps single punctuation to its real virtual key (\".\" is Period, not Delete)", async () => {
+    state.debuggerState.commands = [];
+    await d.handle({ jsonrpc: "2.0", id: 341, method: "page.pressKey", params: { tabId: 1, key: "." } });
+    const down = state.debuggerState.commands.find((c: any) => c.method === "Input.dispatchKeyEvent" && c.params.type === "keyDown");
+    expect(down.params).toMatchObject({ code: "Period", windowsVirtualKeyCode: 190, text: "." });
+  });
+
+  it("page.pressKey returns the settled focus summary", async () => {
+    const resp = await d.handle({ jsonrpc: "2.0", id: 342, method: "page.pressKey", params: { tabId: 1, key: "Tab" } });
+    expect((resp.result as any).focus).toMatchObject({ tag: "div", settled: true });
+    const none = await d.handle({ jsonrpc: "2.0", id: 343, method: "page.pressKey", params: { tabId: 1, key: "Tab", settle: false } });
+    expect((none.result as any).focus).toBeUndefined();
+  });
+
+  // --- clearing through real input ---
+  it("page.type clear=true empties an input by selecting it and pressing Backspace (no value assignment)", async () => {
+    const uids = await snapshotUids(1);
+    state.debuggerState.clearKind = "input";
+    state.debuggerState.commands = [];
+    const resp = await d.handle({ jsonrpc: "2.0", id: 344, method: "page.type", params: { tabId: 1, uid: uids[1], text: "new" } });
+    expect((resp.result as any).ok).toBe(true);
+    const downs = state.debuggerState.commands
+      .filter((c: any) => c.method === "Input.dispatchKeyEvent" && c.params.type === "keyDown")
+      .map((c: any) => c.params.key);
+    expect(downs).toEqual(["Backspace", "n", "e", "w"]);
+    const assignments = state.debuggerState.commands.filter(
+      (c: any) => c.method === "Runtime.callFunctionOn" &&
+        /this\.value\s*=\s*''|textContent\s*=\s*''/.test(c.params?.functionDeclaration ?? ""),
+    );
+    expect(assignments.length).toBe(0);
+  });
+
+  it("page.type clear=true on a contenteditable uses the platform select-all shortcut first", async () => {
+    (globalThis as any).chrome.runtime = { getPlatformInfo: vi.fn(async () => ({ os: "linux" })) };
+    const uids = await snapshotUids(1);
+    state.debuggerState.clearKind = "editable";
+    state.debuggerState.commands = [];
+    await d.handle({ jsonrpc: "2.0", id: 345, method: "page.type", params: { tabId: 1, uid: uids[1], text: "x" } });
+    const downs = state.debuggerState.commands.filter((c: any) => c.method === "Input.dispatchKeyEvent" && c.params.type === "keyDown");
+    expect(downs[0].params).toMatchObject({ key: "a", modifiers: 2 }); // Ctrl+A on Linux
+    expect(downs[1].params.key).toBe("Backspace");
+    expect(downs[2].params.key).toBe("x");
+  });
+
+  it("page.type refuses to type when the field could not be cleared (no silent prepend)", async () => {
+    const uids = await snapshotUids(1);
+    state.debuggerState.clearKind = "editable";
+    state.debuggerState.textAfterClear = "s3";
+    state.debuggerState.commands = [];
+    const resp = await d.handle({ jsonrpc: "2.0", id: 346, method: "page.type", params: { tabId: 1, uid: uids[1], text: "via-fbar" } });
+    expect(resp.error?.message).toMatch(/couldn't clear the field/);
+    expect(resp.error?.message).toContain("s3");
+    const typed = state.debuggerState.commands.filter(
+      (c: any) => c.method === "Input.dispatchKeyEvent" && c.params.type === "keyDown" && c.params.key === "v",
+    );
+    expect(typed.length).toBe(0);
+  });
+
+  // --- generic typed-text fidelity ---
+  async function withFocusOverride(override: Record<string, unknown>, fn: () => Promise<void>) {
+    const orig = (globalThis as any).chrome.debugger.sendCommand;
+    (globalThis as any).chrome.debugger.sendCommand = vi.fn(async (t: any, method: string, params: any) => {
+      const r = await orig(t, method, params);
+      if (method === "Runtime.evaluate" && typeof params?.expression === "string" &&
+          params.expression.includes("activeElement") && r?.result?.type === "object") {
+        return { result: { type: "object", value: { ...r.result.value, ...override } } };
+      }
+      return r;
+    });
+    try { await fn(); } finally { (globalThis as any).chrome.debugger.sendCommand = orig; }
+  }
+
+  it("page.type requireEmpty only judges values/text — an accessible name alone is not content", async () => {
+    await withFocusOverride({
+      activeText: undefined, activeDescendant: "cell-readout",
+      activeDescendantText: undefined, activeDescendantValue: undefined, activeDescendantName: "something . B2 .",
+    }, async () => {
+      const resp = await d.handle({ jsonrpc: "2.0", id: 347, method: "page.type", params: { tabId: 1, text: "x", requireEmpty: true } });
+      expect((resp.result as any).ok).toBe(true);
+    });
+  });
+
+  it("page.type drops an inline auto-completion so the field holds exactly the typed text", async () => {
+    await attachFocusedFrame();
+    state.debuggerState.fieldTexts = ["", "Apple", "Ap"]; // before typing, after typing, after Delete
+    state.debuggerState.commands = [];
+    const resp = await d.handle({ jsonrpc: "2.0", id: 348, method: "page.type", params: { tabId: 1, text: "Ap" } });
+    expect((resp.result as any).completion).toEqual({ typed: "Ap", fieldShowed: "Apple", removed: true, fieldNow: "Ap" });
+    const downs = state.debuggerState.commands
+      .filter((c: any) => c.method === "Input.dispatchKeyEvent" && c.params.type === "keyDown")
+      .map((c: any) => c.params.key);
+    expect(downs).toEqual(["A", "p", "Delete"]);
+    // Everything went to the focused frame.
+    const keys = state.debuggerState.commands.filter((c: any) => c.method === "Input.dispatchKeyEvent");
+    expect(keys.every((c: any) => c.target?.targetId === "grid-frame")).toBe(true);
+  });
+
+  it("page.type leaves text alone when the field already had content (caret position unknown)", async () => {
+    state.debuggerState.fieldTexts = ["Hello ", "Hello Apple"];
+    state.debuggerState.commands = [];
+    const resp = await d.handle({ jsonrpc: "2.0", id: 349, method: "page.type", params: { tabId: 1, text: "Ap" } });
+    expect((resp.result as any).completion).toBeUndefined();
+    const downs = state.debuggerState.commands.filter((c: any) => c.method === "Input.dispatchKeyEvent" && c.params.type === "keyDown");
+    expect(downs.map((c: any) => c.params.key)).toEqual(["A", "p"]);
+  });
+
+  it("page.type exact:false keeps an inline auto-completion", async () => {
+    state.debuggerState.fieldTexts = ["", "Apple"];
+    state.debuggerState.commands = [];
+    const resp = await d.handle({ jsonrpc: "2.0", id: 350, method: "page.type", params: { tabId: 1, text: "Ap", exact: false } });
+    expect((resp.result as any).completion).toBeUndefined();
+    const del = state.debuggerState.commands.filter((c: any) => c.method === "Input.dispatchKeyEvent" && c.params.key === "Delete");
+    expect(del.length).toBe(0);
+  });
+
+  it("page.type skips the completion check for multi-field text (\\t / \\n move focus)", async () => {
+    state.debuggerState.fieldTexts = ["", "Apple"];
+    const resp = await d.handle({ jsonrpc: "2.0", id: 351, method: "page.type", params: { tabId: 1, text: "Ap\tb" } });
+    expect((resp.result as any).completion).toBeUndefined();
+  });
+
+  it("page.type (uid path) drops an inline completion in the element it typed into", async () => {
+    const uids = await snapshotUids(1);
+    state.debuggerState.elementFieldTexts = ["", "Apple", "Ap"];
+    state.debuggerState.commands = [];
+    const resp = await d.handle({ jsonrpc: "2.0", id: 352, method: "page.type", params: { tabId: 1, uid: uids[1], text: "Ap" } });
+    expect((resp.result as any).completion).toMatchObject({ fieldShowed: "Apple", removed: true });
+  });
+
+  it("page.type reports a suggestion list the typing opened (and only that one)", async () => {
+    state.debuggerState.popupsBeforeKeys = [{ role: "dialog", label: "Always there" }];
+    state.debuggerState.popupsAfterKeys = [{ role: "dialog", label: "Always there" }, { role: "listbox", items: 3 }];
+    const resp = await d.handle({ jsonrpc: "2.0", id: 353, method: "page.type", params: { tabId: 1, text: "Ap" } });
+    expect((resp.result as any).focus.popups).toEqual([{ role: "listbox", items: 3 }]);
+  });
+
+  it("page.pressKey reports popups that the key opened, plus aria-expanded", async () => {
+    state.debuggerState.popupsBeforeKeys = [];
+    state.debuggerState.popupsAfterKeys = [{ role: "menu", items: 12 }];
+    state.debuggerState.expandedAfterKeys = "true";
+    const resp = await d.handle({ jsonrpc: "2.0", id: 354, method: "page.pressKey", params: { tabId: 1, key: "ArrowDown" } });
+    expect((resp.result as any).focus).toMatchObject({ popups: [{ role: "menu", items: 12 }], expanded: true });
+  });
+
+  // --- frame targeting ---
+  it("page.evalJs frame=focused evaluates inside the focused OOPIF and labels the frame", async () => {
+    await attachFocusedFrame();
+    state.debuggerState.commands = [];
+    const resp = await d.handle({ jsonrpc: "2.0", id: 349, method: "page.evalJs", params: { tabId: 1, expression: "1+1", frame: "focused" } });
+    const ev = state.debuggerState.commands.find((c: any) => c.method === "Runtime.evaluate" && c.params.expression === "1+1");
+    expect(ev.target).toEqual({ targetId: "grid-frame" });
+    expect((resp.result as any).frame).toBe("https://grid.example/");
+  });
+
+  it("page.evalJs frame=<regex> picks the frame whose LIVE url matches", async () => {
+    await attachFocusedFrame();
+    state.debuggerState.frameUrls["grid-frame"] = "https://editor.app.example/frame.aspx?lang=it-IT";
+    state.debuggerState.commands = [];
+    await d.handle({ jsonrpc: "2.0", id: 350, method: "page.evalJs", params: { tabId: 1, expression: "2+2", frame: "editor\\.app\\.example" } });
+    const ev = state.debuggerState.commands.find((c: any) => c.method === "Runtime.evaluate" && c.params.expression === "2+2");
+    expect(ev.target).toEqual({ targetId: "grid-frame" });
+  });
+
+  it("page.evalJs frame=<regex> with no match lists the frames it saw", async () => {
+    await attachFocusedFrame();
+    const resp = await d.handle({ jsonrpc: "2.0", id: 351, method: "page.evalJs", params: { tabId: 1, expression: "1", frame: "nomatch\\.example" } });
+    expect(resp.error?.message).toMatch(/no frame URL matches/);
+    expect(resp.error?.message).toContain("grid.example");
+  });
+
+  it("page.wait function mode honours frame", async () => {
+    await attachFocusedFrame();
+    state.debuggerState.commands = [];
+    await d.handle({ jsonrpc: "2.0", id: 352, method: "page.wait", params: { tabId: 1, for: "function", expression: "true", frame: "focused", timeoutMs: 500 } });
+    const ev = state.debuggerState.commands.find((c: any) => c.method === "Runtime.evaluate" && c.params.expression === "true");
+    expect(ev.target).toEqual({ targetId: "grid-frame" });
+  });
+
+  // --- stable uids ---
+  it("page.snapshot keeps the same uid for the same DOM node across snapshots", async () => {
+    const first = await snapshotUids(11);
+    state.debuggerState.extraAxNode = true;
+    const second = await snapshotUids(11);
+    expect(second.slice(0, first.length)).toEqual(first);
+    expect(second.length).toBe(first.length + 1);
+    // ...so a uid from the first snapshot still resolves after a since:"last" diff.
+    const diff = await d.handle({ jsonrpc: "2.0", id: 353, method: "page.snapshot", params: { tabId: 11, since: "last" } });
+    expect((diff.result as any).diff).toEqual({ added: 0, removed: 0 });
+    const click = await d.handle({ jsonrpc: "2.0", id: 354, method: "page.click", params: { tabId: 11, uid: first[1] } });
+    expect((click.result as any).ok).toBe(true);
   });
 
   // --- page.wait ---

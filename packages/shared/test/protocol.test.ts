@@ -30,6 +30,12 @@ import {
   PageDragParamsSchema,
   PageFetchParamsSchema,
   PageEvalJsParamsSchema,
+  PageEvalJsResultSchema,
+  PageClickXyResultSchema,
+  PagePasteResultSchema,
+  PageTypeResultSchema,
+  PagePressKeyResultSchema,
+  FocusSummarySchema,
   ConsoleReadParamsSchema,
   ConsoleReadResultSchema,
   NetworkReadParamsSchema,
@@ -563,5 +569,95 @@ describe("protocol round-trip", () => {
   });
   it("page.scroll wheel mode rejects missing deltas", () => {
     expect(() => PageScrollParamsSchema.parse({ tabId: 1, mode: "wheel" })).toThrow();
+  });
+
+  // --- coordinate-true screenshots ---
+  it("page.screenshot defaults maxEdge=1568 and maxPixels=1.15MP, accepts a clip", () => {
+    const p = PageScreenshotParamsSchema.parse({ tabId: 1 });
+    expect(p.maxEdge).toBe(1568);
+    expect(p.maxPixels).toBe(1_150_000);
+    expect(p.clip).toBeUndefined();
+    const c = PageScreenshotParamsSchema.parse({ tabId: 1, clip: { x: 10, y: 20, width: 300, height: 200 } });
+    expect(c.clip).toEqual({ x: 10, y: 20, width: 300, height: 200 });
+  });
+  it("page.screenshot rejects a zero-size clip", () => {
+    expect(() => PageScreenshotParamsSchema.parse({ tabId: 1, clip: { x: 0, y: 0, width: 0, height: 10 } })).toThrow();
+  });
+  it("page.screenshot result round-trips the image→viewport transform", () => {
+    const r = {
+      format: "jpeg" as const, base64: "AAAA",
+      image: { width: 1568, height: 700 }, scale: 1.6327, origin: { x: 0, y: 0 }, capture: "cdp" as const,
+    };
+    const once = PageScreenshotResultSchema.parse(r);
+    expect(PageScreenshotResultSchema.parse(JSON.parse(JSON.stringify(once)))).toEqual(once);
+  });
+  it("page.clickXy defaults space=screenshot and settle=true; accepts space=css", () => {
+    const p = PageClickXyParamsSchema.parse({ tabId: 1, x: 5, y: 6 });
+    expect(p.space).toBe("screenshot");
+    expect(p.settle).toBe(true);
+    expect(PageClickXyParamsSchema.parse({ tabId: 1, x: 5, y: 6, space: "css" }).space).toBe("css");
+    expect(() => PageClickXyParamsSchema.parse({ tabId: 1, x: 5, y: 6, space: "device" })).toThrow();
+  });
+  it("page.clickXy result round-trips point/spaceUsed/focus", () => {
+    const r = {
+      ok: true as const, point: { x: 258.16, y: 300.4 }, spaceUsed: "screenshot" as const,
+      focus: { frame: "https://app.example/editor", tag: "div", role: "textbox", activeDescendantName: "C5", settled: true, waitedMs: 180 },
+    };
+    expect(PageClickXyResultSchema.parse(JSON.parse(JSON.stringify(PageClickXyResultSchema.parse(r))))).toEqual(r);
+  });
+  it("page.paste defaults space=screenshot; result carries verified delivery", () => {
+    expect(PagePasteParamsSchema.parse({ tabId: 1, text: "a", target: "xy", x: 1, y: 2 }).space).toBe("screenshot");
+    const r = { ok: true as const, bytesWritten: 3, pasteDelivered: true, pasteHandledByPage: true };
+    expect(PagePasteResultSchema.parse(r)).toEqual(r);
+  });
+
+  // --- multi-OS modifiers ---
+  it("modifiers accept the portable ControlOrMeta on press_key and type", () => {
+    expect(PagePressKeyParamsSchema.parse({ tabId: 1, key: "v", modifiers: ["ControlOrMeta"] }).modifiers).toEqual(["ControlOrMeta"]);
+    expect(PageTypeParamsSchema.parse({ tabId: 1, text: "a", modifiers: ["ControlOrMeta", "Shift"] }).modifiers).toEqual(["ControlOrMeta", "Shift"]);
+    expect(() => PagePressKeyParamsSchema.parse({ tabId: 1, key: "v", modifiers: ["Cmd"] })).toThrow();
+  });
+  it("press_key/type default settle=true and their results round-trip a focus summary", () => {
+    expect(PagePressKeyParamsSchema.parse({ tabId: 1, key: "Enter" }).settle).toBe(true);
+    expect(PageTypeParamsSchema.parse({ tabId: 1, text: "x" }).settle).toBe(true);
+    const r = { ok: true as const, focus: { tag: "input", role: "combobox", value: "A12", settled: false, waitedMs: 2000 } };
+    expect(PageTypeResultSchema.parse(r)).toEqual(r);
+    expect(PagePressKeyResultSchema.parse(r)).toEqual(r);
+    expect(FocusSummarySchema.parse(r.focus)).toEqual(r.focus);
+  });
+
+  // --- frame targeting ---
+  it("page.evalJs and page.wait accept a frame selector; evalJs result labels the frame", () => {
+    expect(PageEvalJsParamsSchema.parse({ expression: "1", frame: "focused" }).frame).toBe("focused");
+    expect(PageWaitParamsSchema.parse({ tabId: 1, for: "function", expression: "true", frame: "app\\.example" }).frame).toBe("app\\.example");
+    expect(() => PageEvalJsParamsSchema.parse({ expression: "1", frame: "" })).toThrow();
+    const r = { type: "number", value: 2, frame: "https://app.example/editor" };
+    expect(PageEvalJsResultSchema.parse(r)).toEqual(r);
+  });
+
+  // --- typed-text fidelity: inline completion + popups ---
+  it("page.type defaults exact=true; the result round-trips a completion report", () => {
+    expect(PageTypeParamsSchema.parse({ tabId: 1, text: "Ap" }).exact).toBe(true);
+    expect(PageTypeParamsSchema.parse({ tabId: 1, text: "Ap", exact: false }).exact).toBe(false);
+    const r = {
+      ok: true as const,
+      completion: { typed: "Ap", fieldShowed: "Apple", removed: true, fieldNow: "Ap" },
+      focus: { tag: "div", role: "textbox", text: "Ap", settled: true, waitedMs: 180 },
+    };
+    expect(PageTypeResultSchema.parse(JSON.parse(JSON.stringify(PageTypeResultSchema.parse(r))))).toEqual(r);
+    expect(() => PageTypeResultSchema.parse({ ok: true, completion: { typed: "Ap" } })).toThrow();
+  });
+  it("focus summaries and page.focusState carry popups (role/label/items) and expanded", () => {
+    const summary = {
+      tag: "input", role: "combobox", value: "=SOM", settled: true, waitedMs: 200,
+      popups: [{ role: "listbox", items: 12 }, { role: "dialog", label: "Insert function" }], expanded: true,
+    };
+    expect(FocusSummarySchema.parse(summary)).toEqual(summary);
+    expect(() => FocusSummarySchema.parse({ ...summary, popups: [{ role: "menu", items: 1.5 }] })).toThrow();
+    const state = {
+      ok: true as const, url: "https://a", title: "a", documentHasFocus: true, activeTag: "input",
+      activeExpanded: "true", popups: [{ role: "menu", items: 3 }],
+    };
+    expect(PageFocusStateResultSchema.parse(state)).toEqual(state);
   });
 });
